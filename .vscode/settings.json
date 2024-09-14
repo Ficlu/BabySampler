@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "combaseapi.h": "c",
+        "audio_capture.h": "c"
+    }
+}

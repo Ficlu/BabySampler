@@ -7,9 +7,9 @@ void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx) {
     WORD  formatTag = WAVE_FORMAT_PCM;
     WORD  channels = pwfx->nChannels;
     DWORD sampleRate = pwfx->nSamplesPerSec;
-    DWORD byteRate = pwfx->nAvgBytesPerSec;
-    WORD  blockAlign = pwfx->nBlockAlign;
-    WORD  bitsPerSample = pwfx->wBitsPerSample;
+    WORD  bitsPerSample = 16; // Always use 16-bit
+    WORD  blockAlign = channels * (bitsPerSample / 8);
+    DWORD byteRate = sampleRate * blockAlign;
 
     fseek(file, 0, SEEK_SET);
 

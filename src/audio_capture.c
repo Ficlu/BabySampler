@@ -31,6 +31,11 @@ HRESULT InitializeAudioCapture(AudioCaptureContext *ctx) {
     hr = ctx->pAudioClient->lpVtbl->GetMixFormat(ctx->pAudioClient, &ctx->pwfx);
     if (FAILED(hr)) return hr;
 
+    // Debugging output: print sample rate and bit depth
+    printf("Sample Rate: %lu\n", ctx->pwfx->nSamplesPerSec);
+    printf("Channels: %d\n", ctx->pwfx->nChannels);
+    printf("Bits per Sample: %d\n", ctx->pwfx->wBitsPerSample);
+
     // Initialize the audio client in loopback mode
     hr = ctx->pAudioClient->lpVtbl->Initialize(ctx->pAudioClient,
                                                AUDCLNT_SHAREMODE_SHARED,
@@ -49,6 +54,11 @@ HRESULT InitializeAudioCapture(AudioCaptureContext *ctx) {
     ctx->bytesPerSample = ctx->pwfx->wBitsPerSample / 8;
     ctx->blockAlign = ctx->pwfx->nBlockAlign;
     ctx->captureBufferSize = ctx->bufferFrameCount * ctx->blockAlign;
+
+    // Debugging output: print buffer size
+    printf("Buffer Frame Count: %lu\n", ctx->bufferFrameCount);
+    printf("Buffer Size: %d bytes\n", ctx->captureBufferSize);
+
     ctx->captureBuffer = (BYTE *)malloc(ctx->captureBufferSize);
     ctx->dataLength = 0;
 
@@ -90,14 +100,41 @@ HRESULT CaptureAudioData(AudioCaptureContext *ctx) {
             hr = ctx->pCaptureClient->lpVtbl->GetBuffer(ctx->pCaptureClient, &pData, &packetLength, &flags, NULL, NULL);
             if (FAILED(hr)) break;
 
-            UINT32 bytesToWrite = packetLength * ctx->blockAlign;
+            UINT32 frameCount = packetLength;
+            UINT32 bytesPerFrame = ctx->blockAlign;
+            UINT32 totalBytes = frameCount * bytesPerFrame;
 
-            // Write PCM data to WAV file
-            fwrite(pData, bytesToWrite, 1, ctx->file);
-            ctx->dataLength += bytesToWrite;
+            // Handle silence (write zeros if the buffer is silent)
+            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                memset(pData, 0, totalBytes);
+            }
+
+            // Convert 32-bit float to 16-bit PCM
+            if (ctx->pwfx->wBitsPerSample == 32) {
+                int sampleCount = frameCount * ctx->pwfx->nChannels;
+                short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
+                float *floatData = (float *)pData;
+
+                for (int i = 0; i < sampleCount; ++i) {
+                    float sample = floatData[i];
+                    if (sample > 1.0f) sample = 1.0f;
+                    if (sample < -1.0f) sample = -1.0f;
+                    convertedBuffer[i] = (short)(sample * 32767);
+                }
+
+                // Write 16-bit PCM data to file
+                fwrite(convertedBuffer, sizeof(short), sampleCount, ctx->file);
+                ctx->dataLength += sampleCount * sizeof(short);
+
+                free(convertedBuffer);
+            } else {
+                // Write directly if 16-bit PCM
+                fwrite(pData, totalBytes, 1, ctx->file);
+                ctx->dataLength += totalBytes;
+            }
 
             // Release the buffer
-            hr = ctx->pCaptureClient->lpVtbl->ReleaseBuffer(ctx->pCaptureClient, packetLength);
+            hr = ctx->pCaptureClient->lpVtbl->ReleaseBuffer(ctx->pCaptureClient, frameCount);
             if (FAILED(hr)) break;
 
             // Get the next packet size

@@ -17,7 +17,7 @@ int main() {
     // Initialize audio capture
     hr = InitializeAudioCapture(&ctx);
     if (FAILED(hr)) {
-        printf("Failed to initialize audio capture: 0x%08lx\n", hr);  // Changed to %08lx
+        printf("Failed to initialize audio capture: 0x%08lx\n", hr);
         return -1;
     }
     pwfx = ctx.pwfx;
@@ -39,7 +39,7 @@ int main() {
     // Start capturing and processing data
     hr = StartAudioCapture(&ctx);
     if (FAILED(hr)) {
-        printf("Failed to start audio capture: 0x%08lx\n", hr);  // Changed to %08lx
+        printf("Failed to start audio capture: 0x%08lx\n", hr);
         CleanupAudioCapture(&ctx);
         return -1;
     }
@@ -47,7 +47,7 @@ int main() {
     // Main capture loop
     hr = CaptureAudioData(&ctx);
     if (FAILED(hr)) {
-        printf("Error during audio capture: 0x%08lx\n", hr);  // Changed to %08lx
+        printf("Error during audio capture: 0x%08lx\n", hr);
     }
 
     // Finalize output file
