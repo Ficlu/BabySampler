@@ -22,34 +22,30 @@ BYTE *playbackBuffer = NULL;
 DWORD bufferSize = 0;
 DWORD capturedBytes = 0;
 DWORD playbackBufferSize = 0;
+DWORD g_nSamplesPerSec = 0;
+WORD g_nChannels = 0;
 
 // Function prototypes
 void PlayAudio(HWND hwnd);
 void StopAudio();
 void SaveAudio(HWND hwnd);
 
-// Debug logging function
-void DebugLog(const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    char buffer[1024];
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    OutputDebugStringA(buffer);
-}
-
 DWORD WINAPI RecordingThread(LPVOID lpParam)
 {
     HWND hwnd = (HWND)lpParam;
     HRESULT hr;
 
-    DebugLog("Starting recording thread\n");
+    printf("Starting recording thread\n");
 
     hr = InitializeAudioCapture(&ctx);
     if (FAILED(hr)) {
         MessageBox(hwnd, "Failed to initialize audio capture", "Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    g_nSamplesPerSec = ctx.pwfx->nSamplesPerSec;
+    g_nChannels = ctx.pwfx->nChannels;
+    printf("Stored format: channels=%d, sample rate=%d\n", g_nChannels, g_nSamplesPerSec);
 
     bufferSize = INITIAL_BUFFER_SIZE;
     audioBuffer = (BYTE*)malloc(bufferSize);
@@ -67,7 +63,7 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         return 1;
     }
 
-    DebugLog("Audio capture started\n");
+    printf("Audio capture started\n");
 
     capturedBytes = 0;
     while (isRecording) {
@@ -89,7 +85,6 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             UINT32 totalBytes = frameCount * bytesPerFrame;
 
             if (capturedBytes + totalBytes > bufferSize) {
-                // Grow the buffer
                 DWORD newBufferSize = bufferSize * BUFFER_GROWTH_FACTOR;
                 BYTE *newBuffer = (BYTE*)realloc(audioBuffer, newBufferSize);
                 if (!newBuffer) {
@@ -99,7 +94,7 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
                 }
                 audioBuffer = newBuffer;
                 bufferSize = newBufferSize;
-                DebugLog("Grew audio buffer to %u bytes\n", bufferSize);
+                printf("Grew audio buffer to %u bytes\n", bufferSize);
             }
 
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
@@ -119,7 +114,7 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         if (FAILED(hr)) break;
     }
 
-    DebugLog("Recording stopped. Captured %u bytes\n", capturedBytes);
+    printf("Recording stopped. Captured %u bytes\n", capturedBytes);
 
     ctx.pAudioClient->lpVtbl->Stop(ctx.pAudioClient);
     CleanupAudioCapture(&ctx);
@@ -132,21 +127,17 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
 
 void PlayAudio(HWND hwnd)
 {
-    DebugLog("PlayAudio called\n");
+    printf("PlayAudio called\n");
 
-    if (!audioBuffer || capturedBytes == 0) {
-        MessageBox(hwnd, "No audio data to play", "Error", MB_OK | MB_ICONERROR);
+    if (!audioBuffer || capturedBytes == 0 || g_nChannels == 0 || g_nSamplesPerSec == 0) {
+        MessageBox(hwnd, "No valid audio data to play", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    // Stop any ongoing playback
     StopAudio();
-
-    // Add a small delay before trying to open the device again
     Sleep(RETRY_DELAY_MS);
 
-    // Convert audio data to 16-bit PCM
-    int sampleCount = capturedBytes / sizeof(float); // Assuming audioBuffer contains float samples
+    int sampleCount = capturedBytes / sizeof(float);
     short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
     if (!convertedBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for playback", "Error", MB_OK | MB_ICONERROR);
@@ -162,24 +153,29 @@ void PlayAudio(HWND hwnd)
     }
 
     playbackBufferSize = sampleCount * sizeof(short);
-    playbackBuffer = (BYTE *)convertedBuffer; // Store the converted buffer in playbackBuffer
+    playbackBuffer = (BYTE *)convertedBuffer;
 
-    DebugLog("Converted %d samples for playback\n", sampleCount);
+    printf("Converted %d samples for playback\n", sampleCount);
 
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
-    wfx.nChannels = ctx.pwfx->nChannels;
-    wfx.nSamplesPerSec = ctx.pwfx->nSamplesPerSec;
-    wfx.wBitsPerSample = 16;  // 16-bit PCM
+    wfx.nChannels = g_nChannels;
+    wfx.nSamplesPerSec = g_nSamplesPerSec;
+    wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+
+    printf("Attempting to open with format: channels=%d, sample rate=%d, bits per sample=%d\n",
+           wfx.nChannels, wfx.nSamplesPerSec, wfx.wBitsPerSample);
 
     MMRESULT result;
     int retryCount = 0;
     do {
         result = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, (DWORD_PTR)hwnd, 0, CALLBACK_WINDOW);
         if (result != MMSYSERR_NOERROR) {
-            DebugLog("waveOutOpen failed with error code %d, retrying...\n", result);
+            char errorMsg[256];
+            waveOutGetErrorTextA(result, errorMsg, sizeof(errorMsg));
+            printf("waveOutOpen failed. Error: %s (code %d), retrying...\n", errorMsg, result);
             Sleep(RETRY_DELAY_MS);
             retryCount++;
         }
@@ -187,19 +183,18 @@ void PlayAudio(HWND hwnd)
 
     if (result != MMSYSERR_NOERROR) {
         char errorMsg[256];
-        snprintf(errorMsg, sizeof(errorMsg), "Failed to open audio output device. Error code: %d", result);
-        MessageBox(hwnd, errorMsg, "Error", MB_OK | MB_ICONERROR);
+        waveOutGetErrorTextA(result, errorMsg, sizeof(errorMsg));
+        char fullErrorMsg[512];
+        snprintf(fullErrorMsg, sizeof(fullErrorMsg), "Failed to open audio output device.\nError: %s (code %d)", errorMsg, result);
+        MessageBox(hwnd, fullErrorMsg, "Error", MB_OK | MB_ICONERROR);
         free(playbackBuffer);
         playbackBuffer = NULL;
         return;
     }
 
-    DebugLog("waveOutOpen succeeded\n");
+    printf("waveOutOpen succeeded\n");
 
-    // Reset the waveHdr structure
     memset(&waveHdr, 0, sizeof(WAVEHDR));
-
-    // Prepare the wave header
     waveHdr.lpData = (LPSTR)playbackBuffer;
     waveHdr.dwBufferLength = playbackBufferSize;
     waveHdr.dwFlags = 0;
@@ -207,29 +202,31 @@ void PlayAudio(HWND hwnd)
     result = waveOutPrepareHeader(hWaveOut, &waveHdr, sizeof(WAVEHDR));
     if (result != MMSYSERR_NOERROR) {
         char errorMsg[256];
-        snprintf(errorMsg, sizeof(errorMsg), "Failed to prepare audio header. Error code: %d", result);
-        MessageBox(hwnd, errorMsg, "Error", MB_OK | MB_ICONERROR);
+        waveOutGetErrorTextA(result, errorMsg, sizeof(errorMsg));
+        printf("Failed to prepare audio header. Error: %s (code %d)\n", errorMsg, result);
         waveOutClose(hWaveOut);
         free(playbackBuffer);
         playbackBuffer = NULL;
+        hWaveOut = NULL;
         return;
     }
 
-    DebugLog("waveOutPrepareHeader succeeded\n");
+    printf("waveOutPrepareHeader succeeded\n");
 
     result = waveOutWrite(hWaveOut, &waveHdr, sizeof(WAVEHDR));
     if (result != MMSYSERR_NOERROR) {
         char errorMsg[256];
-        snprintf(errorMsg, sizeof(errorMsg), "Failed to write audio data. Error code: %d", result);
-        MessageBox(hwnd, errorMsg, "Error", MB_OK | MB_ICONERROR);
+        waveOutGetErrorTextA(result, errorMsg, sizeof(errorMsg));
+        printf("Failed to write audio data. Error: %s (code %d)\n", errorMsg, result);
         waveOutUnprepareHeader(hWaveOut, &waveHdr, sizeof(WAVEHDR));
         waveOutClose(hWaveOut);
         free(playbackBuffer);
         playbackBuffer = NULL;
+        hWaveOut = NULL;
         return;
     }
 
-    DebugLog("waveOutWrite succeeded\n");
+    printf("waveOutWrite succeeded\n");
 
     isPlaying = TRUE;
     UpdatePlayStatus(isPlaying);
@@ -237,59 +234,46 @@ void PlayAudio(HWND hwnd)
 
 void StopAudio()
 {
-    DebugLog("StopAudio called\n");
+    printf("StopAudio called. isPlaying: %d, hWaveOut: %p\n", isPlaying, (void*)hWaveOut);
 
-    if (isPlaying) {
+    if (isPlaying || hWaveOut) {
         if (hWaveOut) {
-            // Stop playback
-            DebugLog("Stopping playback\n");
-            waveOutReset(hWaveOut);
+            MMRESULT result;
 
-            // Unprepare the header
-            MMRESULT result = waveOutUnprepareHeader(hWaveOut, &waveHdr, sizeof(WAVEHDR));
-            if (result != MMSYSERR_NOERROR) {
-                DebugLog("Failed to unprepare audio header. Error code: %d\n", result);
-            } else {
-                DebugLog("waveOutUnprepareHeader succeeded\n");
-            }
+            result = waveOutReset(hWaveOut);
+            printf("waveOutReset result: %d\n", result);
 
-            // Close the device
+            result = waveOutUnprepareHeader(hWaveOut, &waveHdr, sizeof(WAVEHDR));
+            printf("waveOutUnprepareHeader result: %d\n", result);
+
             result = waveOutClose(hWaveOut);
-            if (result != MMSYSERR_NOERROR) {
-                DebugLog("Failed to close audio device. Error code: %d\n", result);
-            } else {
-                DebugLog("waveOutClose succeeded\n");
-            }
+            printf("waveOutClose result: %d\n", result);
+
             hWaveOut = NULL;
         }
 
-        // Free the playback buffer
         if (playbackBuffer) {
             free(playbackBuffer);
             playbackBuffer = NULL;
-            DebugLog("Freed playback buffer\n");
+            printf("Freed playback buffer\n");
         }
 
-        // Reset the wave header
         memset(&waveHdr, 0, sizeof(WAVEHDR));
 
         isPlaying = FALSE;
         UpdatePlayStatus(isPlaying);
-    } else {
-        DebugLog("StopAudio called but isPlaying was already FALSE\n");
     }
 }
 
 void SaveAudio(HWND hwnd)
 {
-    DebugLog("SaveAudio called\n");
+    printf("SaveAudio called\n");
 
-    if (!audioBuffer || capturedBytes == 0) {
-        MessageBox(hwnd, "No audio data to save", "Error", MB_OK | MB_ICONERROR);
+    if (!audioBuffer || capturedBytes == 0 || g_nChannels == 0 || g_nSamplesPerSec == 0) {
+        MessageBox(hwnd, "No valid audio data to save", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    // Stop any ongoing playback
     StopAudio();
 
     FILE *file = fopen("output.wav", "wb");
@@ -298,8 +282,7 @@ void SaveAudio(HWND hwnd)
         return;
     }
 
-    // Convert audio data to 16-bit PCM
-    int sampleCount = capturedBytes / sizeof(float); // Assuming audioBuffer contains float samples
+    int sampleCount = capturedBytes / sizeof(float);
     short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
     if (!convertedBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for saving", "Error", MB_OK | MB_ICONERROR);
@@ -319,16 +302,14 @@ void SaveAudio(HWND hwnd)
 
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
-    wfx.nChannels = ctx.pwfx->nChannels;
-    wfx.nSamplesPerSec = ctx.pwfx->nSamplesPerSec;
-    wfx.wBitsPerSample = 16;  // 16-bit PCM
+    wfx.nChannels = g_nChannels;
+    wfx.nSamplesPerSec = g_nSamplesPerSec;
+    wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
 
-    // Write WAV header
     WriteWavHeader(file, &wfx, dataSize);
 
-    // Write audio data
     size_t written = fwrite(convertedBuffer, 1, dataSize, file);
     free(convertedBuffer);
 
@@ -342,17 +323,17 @@ void SaveAudio(HWND hwnd)
 
     fclose(file);
 
-    DebugLog("Audio saved successfully\n");
+    printf("Audio saved successfully\n");
     MessageBox(hwnd, "Audio saved successfully", "Success", MB_OK | MB_ICONINFORMATION);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
-    DebugLog("Application started\n");
+    printf("Application started\n");
 
     HWND hwnd = InitializeGUI(hInstance, nCmdShow);
     if (hwnd == NULL) {
-        DebugLog("Failed to initialize GUI\n");
+        printf("Failed to initialize GUI\n");
         return 0;
     }
 
@@ -361,7 +342,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     {
         if (msg.message == WM_USER + 1) // Start recording
         {
-            DebugLog("Received Start Recording message\n");
+            printf("Received Start Recording message\n");
             if (!isRecording)
             {
                 isRecording = TRUE;
@@ -371,7 +352,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         else if (msg.message == WM_USER + 2) // Stop recording
         {
-            DebugLog("Received Stop Recording message\n");
+            printf("Received Stop Recording message\n");
             if (isRecording)
             {
                 isRecording = FALSE;
@@ -379,8 +360,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         else if (msg.message == WM_USER + 3) // Play/Stop audio
         {
-            DebugLog("Received Play/Stop Audio message\n");
-            if (!isPlaying)
+            printf("Received Play/Stop Audio message\n");
+if (!isPlaying)
             {
                 PlayAudio(hwnd);
             }
@@ -391,39 +372,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         else if (msg.message == WM_USER + 4) // Save audio
         {
-            DebugLog("Received Save Audio message\n");
+            printf("Received Save Audio message\n");
             SaveAudio(hwnd);
         }
         else if (msg.message == MM_WOM_DONE) // Audio playback finished
         {
-            DebugLog("Received MM_WOM_DONE message\n");
+            printf("Received MM_WOM_DONE message. hWaveOut: %p\n", (void*)hWaveOut);
             if (hWaveOut) {
-                // Unprepare the header
                 MMRESULT result = waveOutUnprepareHeader(hWaveOut, &waveHdr, sizeof(WAVEHDR));
-                if (result != MMSYSERR_NOERROR) {
-                    DebugLog("Failed to unprepare audio header. Error code: %d\n", result);
-                } else {
-                    DebugLog("waveOutUnprepareHeader succeeded\n");
-                }
+                printf("waveOutUnprepareHeader result: %d\n", result);
 
-                // Close the device
                 result = waveOutClose(hWaveOut);
-                if (result != MMSYSERR_NOERROR) {
-                    DebugLog("Failed to close audio device. Error code: %d\n", result);
-                } else {
-                    DebugLog("waveOutClose succeeded\n");
-                }
+                printf("waveOutClose result: %d\n", result);
                 hWaveOut = NULL;
             }
 
-            // Free the playback buffer
             if (playbackBuffer) {
                 free(playbackBuffer);
                 playbackBuffer = NULL;
-                DebugLog("Freed playback buffer\n");
+                printf("Freed playback buffer\n");
             }
 
-            // Reset the wave header
             memset(&waveHdr, 0, sizeof(WAVEHDR));
 
             isPlaying = FALSE;
@@ -440,14 +409,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (audioBuffer) {
         free(audioBuffer);
         audioBuffer = NULL;
-        DebugLog("Freed audio buffer\n");
+        printf("Freed audio buffer\n");
     }
     if (playbackBuffer) {
         free(playbackBuffer);
         playbackBuffer = NULL;
-        DebugLog("Freed playback buffer\n");
+        printf("Freed playback buffer\n");
     }
 
-    DebugLog("Application exiting\n");
+    printf("Application exiting\n");
     return 0;
 }
