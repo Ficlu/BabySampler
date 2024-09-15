@@ -56,7 +56,7 @@ HRESULT InitializeAudioCapture(AudioCaptureContext *ctx) {
     ctx->captureBufferSize = ctx->bufferFrameCount * ctx->blockAlign;
 
     // Debugging output: print buffer size
-    printf("Buffer Frame Count: %lu\n", ctx->bufferFrameCount);
+    printf("Buffer Frame Count: %u\n", ctx->bufferFrameCount);    
     printf("Buffer Size: %d bytes\n", ctx->captureBufferSize);
 
     ctx->captureBuffer = (BYTE *)malloc(ctx->captureBufferSize);

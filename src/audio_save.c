@@ -1,24 +1,18 @@
 // audio_save.c
 #include "audio_save.h"
-
-void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx) {
-    DWORD fileSize = 0; // Placeholder for file size
+void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx, DWORD dataSize) {
+    DWORD fileSize = dataSize + 36; // Total file size minus 8 bytes for RIFF header
     DWORD fmtSize = 16;
-    WORD  formatTag = WAVE_FORMAT_PCM;
+    WORD  formatTag = WAVE_FORMAT_PCM; // Changed to PCM
     WORD  channels = pwfx->nChannels;
     DWORD sampleRate = pwfx->nSamplesPerSec;
-    WORD  bitsPerSample = 16; // Always use 16-bit
-    WORD  blockAlign = channels * (bitsPerSample / 8);
-    DWORD byteRate = sampleRate * blockAlign;
+    WORD  bitsPerSample = pwfx->wBitsPerSample;
+    WORD  blockAlign = pwfx->nBlockAlign;
+    DWORD byteRate = pwfx->nAvgBytesPerSec;
 
-    fseek(file, 0, SEEK_SET);
-
-    // 'RIFF' chunk descriptor
     fwrite("RIFF", 1, 4, file);
-    fwrite(&fileSize, sizeof(DWORD), 1, file); // To be updated later
+    fwrite(&fileSize, sizeof(DWORD), 1, file);
     fwrite("WAVE", 1, 4, file);
-
-    // 'fmt ' sub-chunk
     fwrite("fmt ", 1, 4, file);
     fwrite(&fmtSize, sizeof(DWORD), 1, file);
     fwrite(&formatTag, sizeof(WORD), 1, file);
@@ -27,17 +21,11 @@ void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx) {
     fwrite(&byteRate, sizeof(DWORD), 1, file);
     fwrite(&blockAlign, sizeof(WORD), 1, file);
     fwrite(&bitsPerSample, sizeof(WORD), 1, file);
-
-    // 'data' sub-chunk
     fwrite("data", 1, 4, file);
-    fwrite(&fileSize, sizeof(DWORD), 1, file); // To be updated later
-}
+    fwrite(&dataSize, sizeof(DWORD), 1, file);
 
-void FinalizeWavFile(FILE *file, DWORD dataLength) {
-    DWORD fileSize = dataLength + 36;
-
-    fseek(file, 4, SEEK_SET);
-    fwrite(&fileSize, sizeof(DWORD), 1, file);
-    fseek(file, 40, SEEK_SET);
-    fwrite(&dataLength, sizeof(DWORD), 1, file);
+    // Check if all writes were successful
+    if (ferror(file)) {
+        fprintf(stderr, "Error writing WAV header\n");
+    }
 }

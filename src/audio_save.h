@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include "audio_capture.h"
 
-void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx);
-void FinalizeWavFile(FILE *file, DWORD dataLength);
+void WriteWavHeader(FILE *file, WAVEFORMATEX *pwfx, DWORD dataSize);
 
 #endif // AUDIO_SAVE_H

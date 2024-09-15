@@ -1,2 +1,4 @@
 *.wav
 *.vscode
+settings.json
+*.o
