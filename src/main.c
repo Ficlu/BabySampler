@@ -9,32 +9,41 @@
 #include "audio_capture.h"
 #include "audio_save.h"
 #include "gui.h"
+#include "recording_list.h"
 
 #define INITIAL_BUFFER_SIZE (1024 * 1024)  // Start with 1MB buffer
 #define BUFFER_GROWTH_FACTOR 2
 #define MAX_RETRY_COUNT 3
 #define RETRY_DELAY_MS 100
 
+// State
 BOOL isRecording = FALSE;
 BOOL isPlaying = FALSE;
 AudioCaptureContext ctx = { 0 };
 HWAVEOUT hWaveOut = NULL;
 WAVEHDR waveHdr = {0};
-BYTE *audioBuffer = NULL;
 BYTE *playbackBuffer = NULL;
-DWORD bufferSize = 0;
-DWORD capturedBytes = 0;
 DWORD playbackBufferSize = 0;
-DWORD g_nSamplesPerSec = 0;
-WORD g_nChannels = 0;
 
-// Dithering state - we keep previous random value for TPDF
+// Recording list - replaces single audioBuffer
+RecordingList recordings = {0};
+
+// Temporary buffer used during recording (ownership transfers to list when done)
+BYTE *tempRecordBuffer = NULL;
+DWORD tempBufferSize = 0;
+DWORD tempCapturedBytes = 0;
+DWORD tempSampleRate = 0;
+WORD tempChannels = 0;
+float tempSessionPeak = 0.0f;
+
+// Dithering state
 static float ditherState = 0.0f;
 
 // Function prototypes
 void PlayAudio(HWND hwnd);
 void StopAudio();
 void SaveAudio(HWND hwnd);
+void DeleteRecording(HWND hwnd);
 float CalculatePeakLevel(const float *samples, int sampleCount);
 float CalculateBufferPeak(const BYTE *buffer, DWORD byteCount);
 
@@ -45,7 +54,6 @@ static inline float RandomFloat()
 }
 
 // Calculate peak level from float samples
-// Returns the maximum absolute value found
 float CalculatePeakLevel(const float *samples, int sampleCount)
 {
     float peak = 0.0f;
@@ -60,7 +68,7 @@ float CalculatePeakLevel(const float *samples, int sampleCount)
     return peak;
 }
 
-// Calculate peak from the entire captured buffer
+// Calculate peak from buffer
 float CalculateBufferPeak(const BYTE *buffer, DWORD byteCount)
 {
     int sampleCount = byteCount / sizeof(float);
@@ -68,42 +76,32 @@ float CalculateBufferPeak(const BYTE *buffer, DWORD byteCount)
 }
 
 // Convert float samples to 16-bit PCM with TPDF dithering
-// TPDF (Triangular Probability Density Function) dithering uses the sum of two 
-// uniform random values, which creates a triangular distribution. This effectively
-// decorrelates quantization error from the signal, replacing distortion with a 
-// constant, low-level noise floor.
 void ConvertFloatTo16BitWithDither(const float *input, short *output, int sampleCount)
 {
     const float scale = 32767.0f;
-    const float ditherAmp = 1.0f / scale;  // 1 LSB worth of dither
+    const float ditherAmp = 1.0f / scale;
     
     for (int i = 0; i < sampleCount; i++)
     {
         float sample = input[i];
         
-        // Soft clipping using tanh for samples that exceed range
-        // This sounds more natural than hard clipping
         if (sample > 1.0f || sample < -1.0f)
         {
             sample = tanhf(sample);
         }
         
-        // TPDF dither: sum of two uniform random values gives triangular distribution
         float newRandom = RandomFloat();
         float dither = (ditherState + newRandom) * ditherAmp;
         ditherState = newRandom;
         
-        // Scale to 16-bit range and add dither
         float scaled = sample * scale + dither;
         
-        // Round to nearest integer (not truncate)
         int32_t rounded;
         if (scaled >= 0.0f)
             rounded = (int32_t)(scaled + 0.5f);
         else
             rounded = (int32_t)(scaled - 0.5f);
         
-        // Clamp to valid 16-bit range
         if (rounded > 32767)
             rounded = 32767;
         else if (rounded < -32768)
@@ -117,27 +115,30 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
 {
     HWND hwnd = (HWND)lpParam;
     HRESULT hr;
-    float sessionPeak = 0.0f;  // Track peak across entire recording
     DWORD lastMeterUpdate = 0;
-    const DWORD METER_UPDATE_INTERVAL = 50;  // Update meter every 50ms
+    const DWORD METER_UPDATE_INTERVAL = 50;
 
     printf("Starting recording thread\n");
 
     hr = InitializeAudioCapture(&ctx);
     if (FAILED(hr)) {
         MessageBox(hwnd, "Failed to initialize audio capture", "Error", MB_OK | MB_ICONERROR);
+        isRecording = FALSE;
+        UpdateRecordingStatus(hwnd, FALSE);
         return 1;
     }
 
-    g_nSamplesPerSec = ctx.pwfx->nSamplesPerSec;
-    g_nChannels = ctx.pwfx->nChannels;
-    printf("Stored format: channels=%d, sample rate=%d\n", g_nChannels, g_nSamplesPerSec);
+    tempSampleRate = ctx.pwfx->nSamplesPerSec;
+    tempChannels = ctx.pwfx->nChannels;
+    printf("Capture format: channels=%d, sample rate=%lu\n", tempChannels, tempSampleRate);
 
-    bufferSize = INITIAL_BUFFER_SIZE;
-    audioBuffer = (BYTE*)malloc(bufferSize);
-    if (!audioBuffer) {
+    tempBufferSize = INITIAL_BUFFER_SIZE;
+    tempRecordBuffer = (BYTE*)malloc(tempBufferSize);
+    if (!tempRecordBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for audio buffer", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
+        isRecording = FALSE;
+        UpdateRecordingStatus(hwnd, FALSE);
         return 1;
     }
 
@@ -145,21 +146,26 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     if (FAILED(hr)) {
         MessageBox(hwnd, "Failed to start audio capture", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
-        free(audioBuffer);
+        free(tempRecordBuffer);
+        tempRecordBuffer = NULL;
+        isRecording = FALSE;
+        UpdateRecordingStatus(hwnd, FALSE);
         return 1;
     }
 
     printf("Audio capture started\n");
 
-    capturedBytes = 0;
+    tempCapturedBytes = 0;
+    tempSessionPeak = 0.0f;
+
     while (isRecording) {
-        Sleep(10);  // Sleep to prevent busy waiting
+        Sleep(10);
 
         UINT32 packetLength = 0;
         hr = ctx.pCaptureClient->lpVtbl->GetNextPacketSize(ctx.pCaptureClient, &packetLength);
         if (FAILED(hr)) break;
 
-        float packetPeak = 0.0f;  // Track peak for this batch of packets
+        float packetPeak = 0.0f;
 
         while (packetLength != 0) {
             BYTE *pData;
@@ -172,31 +178,30 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             UINT32 bytesPerFrame = ctx.blockAlign;
             UINT32 totalBytes = frameCount * bytesPerFrame;
 
-            if (capturedBytes + totalBytes > bufferSize) {
-                DWORD newBufferSize = bufferSize * BUFFER_GROWTH_FACTOR;
-                BYTE *newBuffer = (BYTE*)realloc(audioBuffer, newBufferSize);
+            if (tempCapturedBytes + totalBytes > tempBufferSize) {
+                DWORD newBufferSize = tempBufferSize * BUFFER_GROWTH_FACTOR;
+                BYTE *newBuffer = (BYTE*)realloc(tempRecordBuffer, newBufferSize);
                 if (!newBuffer) {
                     MessageBox(hwnd, "Failed to grow audio buffer", "Error", MB_OK | MB_ICONERROR);
                     isRecording = FALSE;
                     break;
                 }
-                audioBuffer = newBuffer;
-                bufferSize = newBufferSize;
-                printf("Grew audio buffer to %u bytes\n", bufferSize);
+                tempRecordBuffer = newBuffer;
+                tempBufferSize = newBufferSize;
+                printf("Grew audio buffer to %lu bytes\n", tempBufferSize);
             }
 
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                memset(audioBuffer + capturedBytes, 0, totalBytes);
+                memset(tempRecordBuffer + tempCapturedBytes, 0, totalBytes);
             } else {
-                memcpy(audioBuffer + capturedBytes, pData, totalBytes);
+                memcpy(tempRecordBuffer + tempCapturedBytes, pData, totalBytes);
                 
-                // Calculate peak for this packet
                 int sampleCount = frameCount * ctx.pwfx->nChannels;
                 float peak = CalculatePeakLevel((float *)pData, sampleCount);
                 if (peak > packetPeak) packetPeak = peak;
-                if (peak > sessionPeak) sessionPeak = peak;
+                if (peak > tempSessionPeak) tempSessionPeak = peak;
             }
-            capturedBytes += totalBytes;
+            tempCapturedBytes += totalBytes;
 
             hr = ctx.pCaptureClient->lpVtbl->ReleaseBuffer(ctx.pCaptureClient, frameCount);
             if (FAILED(hr)) break;
@@ -205,10 +210,8 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             if (FAILED(hr)) break;
         }
 
-        // Update the peak meter at regular intervals (not every packet)
         DWORD now = GetTickCount();
         if (now - lastMeterUpdate >= METER_UPDATE_INTERVAL) {
-            // Send peak value to GUI (multiply by 10000 to preserve precision as integer)
             PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(packetPeak * 10000.0f), 0);
             lastMeterUpdate = now;
         }
@@ -216,15 +219,42 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         if (FAILED(hr)) break;
     }
 
-    printf("Recording stopped. Captured %u bytes\n", capturedBytes);
-    printf("Session peak level: %.4f (%.1f dB)\n", sessionPeak, 
-           sessionPeak > 0 ? 20.0f * log10f(sessionPeak) : -96.0f);
+    printf("Recording stopped. Captured %lu bytes\n", tempCapturedBytes);
+    printf("Session peak level: %.4f (%.1f dB)\n", tempSessionPeak, 
+           tempSessionPeak > 0 ? 20.0f * log10f(tempSessionPeak) : -96.0f);
 
-    // Send final peak reading
-    PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(sessionPeak * 10000.0f), 0);
+    PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(tempSessionPeak * 10000.0f), 0);
 
     ctx.pAudioClient->lpVtbl->Stop(ctx.pAudioClient);
     CleanupAudioCapture(&ctx);
+
+    // Add the recording to the list (if we captured anything)
+    if (tempCapturedBytes > 0 && tempRecordBuffer) {
+        // Shrink buffer to actual size to save memory
+        BYTE *finalBuffer = (BYTE*)realloc(tempRecordBuffer, tempCapturedBytes);
+        if (finalBuffer) {
+            tempRecordBuffer = finalBuffer;
+        }
+        // else keep original buffer, just slightly wasteful
+        
+        int index = RecordingList_Add(&recordings, tempRecordBuffer, tempCapturedBytes,
+                                      tempSampleRate, tempChannels, tempSessionPeak);
+        if (index >= 0) {
+            printf("Added recording %d to list\n", index + 1);
+            // Don't free tempRecordBuffer - ownership transferred to list
+            tempRecordBuffer = NULL;
+        } else {
+            printf("Failed to add recording to list\n");
+            free(tempRecordBuffer);
+            tempRecordBuffer = NULL;
+        }
+    } else if (tempRecordBuffer) {
+        free(tempRecordBuffer);
+        tempRecordBuffer = NULL;
+    }
+
+    // Notify main thread to refresh UI
+    PostMessage(hwnd, WM_RECORDING_ADDED, 0, 0);
 
     UpdateRecordingStatus(hwnd, FALSE);
     isRecording = FALSE;
@@ -236,29 +266,40 @@ void PlayAudio(HWND hwnd)
 {
     printf("PlayAudio called\n");
 
-    if (!audioBuffer || capturedBytes == 0 || g_nChannels == 0 || g_nSamplesPerSec == 0) {
-        MessageBox(hwnd, "No valid audio data to play", "Error", MB_OK | MB_ICONERROR);
+    int selCount = GetSelectedRecordingCount(hwnd);
+    if (selCount == 0) {
+        MessageBox(hwnd, "No recording selected", "Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+    
+    if (selCount > 1) {
+        MessageBox(hwnd, "Select a single recording for playback", "Info", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    int index = GetSelectedRecordingIndex(hwnd);
+    AudioRecording *rec = RecordingList_Get(&recordings, index);
+    if (!rec || !rec->buffer || rec->size == 0) {
+        MessageBox(hwnd, "Invalid recording selected", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
     StopAudio();
     Sleep(RETRY_DELAY_MS);
 
-    // Calculate and display peak of captured buffer
-    float bufferPeak = CalculateBufferPeak(audioBuffer, capturedBytes);
+    float bufferPeak = CalculateBufferPeak(rec->buffer, rec->size);
     printf("Playback buffer peak: %.4f (%.1f dB)\n", bufferPeak,
            bufferPeak > 0 ? 20.0f * log10f(bufferPeak) : -96.0f);
     PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(bufferPeak * 10000.0f), 0);
 
-    int sampleCount = capturedBytes / sizeof(float);
+    int sampleCount = rec->size / sizeof(float);
     short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
     if (!convertedBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for playback", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    // Use improved conversion with dithering
-    ConvertFloatTo16BitWithDither((float *)audioBuffer, convertedBuffer, sampleCount);
+    ConvertFloatTo16BitWithDither((float *)rec->buffer, convertedBuffer, sampleCount);
 
     playbackBufferSize = sampleCount * sizeof(short);
     playbackBuffer = (BYTE *)convertedBuffer;
@@ -267,13 +308,13 @@ void PlayAudio(HWND hwnd)
 
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
-    wfx.nChannels = g_nChannels;
-    wfx.nSamplesPerSec = g_nSamplesPerSec;
+    wfx.nChannels = rec->channels;
+    wfx.nSamplesPerSec = rec->sampleRate;
     wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
 
-    printf("Attempting to open with format: channels=%d, sample rate=%d, bits per sample=%d\n",
+    printf("Attempting to open with format: channels=%d, sample rate=%lu, bits per sample=%d\n",
            wfx.nChannels, wfx.nSamplesPerSec, wfx.wBitsPerSample);
 
     MMRESULT result;
@@ -377,51 +418,106 @@ void SaveAudio(HWND hwnd)
 {
     printf("SaveAudio called\n");
 
-    if (!audioBuffer || capturedBytes == 0 || g_nChannels == 0 || g_nSamplesPerSec == 0) {
-        MessageBox(hwnd, "No valid audio data to save", "Error", MB_OK | MB_ICONERROR);
+    int selCount = 0;
+    int *indices = GetSelectedRecordingIndices(hwnd, &selCount);
+    
+    if (selCount == 0 || !indices) {
+        MessageBox(hwnd, "No recordings selected", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
     StopAudio();
 
-    // Calculate and display peak of buffer being saved
-    float bufferPeak = CalculateBufferPeak(audioBuffer, capturedBytes);
-    printf("Saving buffer peak: %.4f (%.1f dB)\n", bufferPeak,
-           bufferPeak > 0 ? 20.0f * log10f(bufferPeak) : -96.0f);
+    int savedCount = 0;
+    int failedCount = 0;
 
-    FILE *file = fopen("output.wav", "wb");
-    if (!file) {
-        MessageBox(hwnd, "Failed to open output.wav for writing", "Error", MB_OK | MB_ICONERROR);
-        return;
-    }
+    for (int i = 0; i < selCount; i++) {
+        AudioRecording *rec = RecordingList_Get(&recordings, indices[i]);
+        if (!rec || !rec->buffer || rec->size == 0) {
+            failedCount++;
+            continue;
+        }
 
-    // Write 32-bit float WAV header - no conversion needed
-    DWORD dataSize = capturedBytes;
-    WriteWavHeaderFloat(file, g_nSamplesPerSec, g_nChannels, dataSize);
+        // Generate filename with timestamp
+        char filename[128];
+        snprintf(filename, sizeof(filename), "recording_%02d%02d%02d_%02d%02d%02d.wav",
+                 rec->timestamp.wYear % 100, rec->timestamp.wMonth, rec->timestamp.wDay,
+                 rec->timestamp.wHour, rec->timestamp.wMinute, rec->timestamp.wSecond);
 
-    // Write the raw float audio buffer directly - bit-perfect copy
-    size_t written = fwrite(audioBuffer, 1, dataSize, file);
+        float bufferPeak = CalculateBufferPeak(rec->buffer, rec->size);
+        printf("Saving %s - peak: %.4f (%.1f dB)\n", filename, bufferPeak,
+               bufferPeak > 0 ? 20.0f * log10f(bufferPeak) : -96.0f);
 
-    if (written != dataSize) {
-        char errorMsg[256];
-        snprintf(errorMsg, sizeof(errorMsg), "Failed to write all audio data. Written: %zu, Expected: %lu", written, dataSize);
-        MessageBox(hwnd, errorMsg, "Write Error", MB_OK | MB_ICONERROR);
+        FILE *file = fopen(filename, "wb");
+        if (!file) {
+            printf("Failed to open %s for writing\n", filename);
+            failedCount++;
+            continue;
+        }
+
+        WriteWavHeaderFloat(file, rec->sampleRate, rec->channels, rec->size);
+        size_t written = fwrite(rec->buffer, 1, rec->size, file);
         fclose(file);
+
+        if (written != rec->size) {
+            printf("Failed to write all data to %s\n", filename);
+            failedCount++;
+        } else {
+            printf("Saved: %s\n", filename);
+            savedCount++;
+        }
+    }
+
+    free(indices);
+
+    // Show summary
+    char msg[256];
+    if (failedCount == 0) {
+        snprintf(msg, sizeof(msg), "Saved %d recording%s (32-bit float)", 
+                 savedCount, savedCount == 1 ? "" : "s");
+        MessageBox(hwnd, msg, "Success", MB_OK | MB_ICONINFORMATION);
+    } else {
+        snprintf(msg, sizeof(msg), "Saved %d, failed %d", savedCount, failedCount);
+        MessageBox(hwnd, msg, "Partial Success", MB_OK | MB_ICONWARNING);
+    }
+}
+
+void DeleteRecording(HWND hwnd)
+{
+    printf("DeleteRecording called\n");
+
+    int selCount = 0;
+    int *indices = GetSelectedRecordingIndices(hwnd, &selCount);
+    
+    if (selCount == 0 || !indices) {
+        MessageBox(hwnd, "No recordings selected", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    fclose(file);
+    StopAudio();
 
-    printf("Audio saved successfully (32-bit float, lossless)\n");
-    MessageBox(hwnd, "Audio saved successfully (32-bit float)", "Success", MB_OK | MB_ICONINFORMATION);
+    // Delete in reverse order to avoid index shifting issues
+    int deletedCount = 0;
+    for (int i = selCount - 1; i >= 0; i--) {
+        if (RecordingList_Remove(&recordings, indices[i])) {
+            deletedCount++;
+            printf("Deleted recording at index %d\n", indices[i]);
+        }
+    }
+
+    free(indices);
+
+    printf("Deleted %d recording(s)\n", deletedCount);
+    RefreshRecordingList(hwnd, &recordings);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     printf("Application started\n");
 
-    // Seed random number generator for dithering
     srand((unsigned int)time(NULL));
+
+    RecordingList_Init(&recordings);
 
     HWND hwnd = InitializeGUI(hInstance, nCmdShow);
     if (hwnd == NULL) {
@@ -439,6 +535,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             {
                 isRecording = TRUE;
                 UpdateRecordingStatus(hwnd, TRUE);
+                UpdateButtonStates(hwnd, FALSE, TRUE);
                 CreateThread(NULL, 0, RecordingThread, hwnd, 0, NULL);
             }
         }
@@ -466,6 +563,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         {
             printf("Received Save Audio message\n");
             SaveAudio(hwnd);
+        }
+        else if (msg.message == WM_USER + 5) // Delete recording
+        {
+            printf("Received Delete Recording message\n");
+            DeleteRecording(hwnd);
+        }
+        else if (msg.message == WM_USER + 6) // Selection changed in listbox
+        {
+            int selCount = GetSelectedRecordingCount(hwnd);
+            printf("Selection changed, %d item(s) selected\n", selCount);
+            UpdateButtonStates(hwnd, selCount > 0, isRecording);
+        }
+        else if (msg.message == WM_RECORDING_ADDED) // Recording finished, refresh list
+        {
+            printf("Recording added, refreshing list\n");
+            RefreshRecordingList(hwnd, &recordings);
         }
         else if (msg.message == MM_WOM_DONE) // Audio playback finished
         {
@@ -498,11 +611,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Free resources before exiting
-    if (audioBuffer) {
-        free(audioBuffer);
-        audioBuffer = NULL;
-        printf("Freed audio buffer\n");
-    }
+    RecordingList_Free(&recordings);
+    
     if (playbackBuffer) {
         free(playbackBuffer);
         playbackBuffer = NULL;
