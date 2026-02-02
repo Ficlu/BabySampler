@@ -89,7 +89,7 @@ HRESULT CaptureAudioData(AudioCaptureContext *ctx) {
 
     while (capturing) {
         // Sleep for a while
-        Sleep(10);
+        Sleep(20);
 
         // Get the available data size
         hr = ctx->pCaptureClient->lpVtbl->GetNextPacketSize(ctx->pCaptureClient, &packetLength);

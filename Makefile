@@ -1,7 +1,7 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -g
-LDFLAGS = -lole32 -luuid -lwinmm -ldsound -lgdi32
+LDFLAGS = -lole32 -luuid -lwinmm -ldsound -lgdi32 -lcomctl32
 
 # Directories
 SRCDIR = src

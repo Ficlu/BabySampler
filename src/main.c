@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <mmsystem.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
 #include "audio_capture.h"
 #include "audio_save.h"
 #include "gui.h"
@@ -25,15 +28,98 @@ DWORD playbackBufferSize = 0;
 DWORD g_nSamplesPerSec = 0;
 WORD g_nChannels = 0;
 
+// Dithering state - we keep previous random value for TPDF
+static float ditherState = 0.0f;
+
 // Function prototypes
 void PlayAudio(HWND hwnd);
 void StopAudio();
 void SaveAudio(HWND hwnd);
+float CalculatePeakLevel(const float *samples, int sampleCount);
+float CalculateBufferPeak(const BYTE *buffer, DWORD byteCount);
+
+// Generate a random float between -1.0 and 1.0
+static inline float RandomFloat()
+{
+    return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+}
+
+// Calculate peak level from float samples
+// Returns the maximum absolute value found
+float CalculatePeakLevel(const float *samples, int sampleCount)
+{
+    float peak = 0.0f;
+    for (int i = 0; i < sampleCount; i++)
+    {
+        float absVal = fabsf(samples[i]);
+        if (absVal > peak)
+        {
+            peak = absVal;
+        }
+    }
+    return peak;
+}
+
+// Calculate peak from the entire captured buffer
+float CalculateBufferPeak(const BYTE *buffer, DWORD byteCount)
+{
+    int sampleCount = byteCount / sizeof(float);
+    return CalculatePeakLevel((const float *)buffer, sampleCount);
+}
+
+// Convert float samples to 16-bit PCM with TPDF dithering
+// TPDF (Triangular Probability Density Function) dithering uses the sum of two 
+// uniform random values, which creates a triangular distribution. This effectively
+// decorrelates quantization error from the signal, replacing distortion with a 
+// constant, low-level noise floor.
+void ConvertFloatTo16BitWithDither(const float *input, short *output, int sampleCount)
+{
+    const float scale = 32767.0f;
+    const float ditherAmp = 1.0f / scale;  // 1 LSB worth of dither
+    
+    for (int i = 0; i < sampleCount; i++)
+    {
+        float sample = input[i];
+        
+        // Soft clipping using tanh for samples that exceed range
+        // This sounds more natural than hard clipping
+        if (sample > 1.0f || sample < -1.0f)
+        {
+            sample = tanhf(sample);
+        }
+        
+        // TPDF dither: sum of two uniform random values gives triangular distribution
+        float newRandom = RandomFloat();
+        float dither = (ditherState + newRandom) * ditherAmp;
+        ditherState = newRandom;
+        
+        // Scale to 16-bit range and add dither
+        float scaled = sample * scale + dither;
+        
+        // Round to nearest integer (not truncate)
+        int32_t rounded;
+        if (scaled >= 0.0f)
+            rounded = (int32_t)(scaled + 0.5f);
+        else
+            rounded = (int32_t)(scaled - 0.5f);
+        
+        // Clamp to valid 16-bit range
+        if (rounded > 32767)
+            rounded = 32767;
+        else if (rounded < -32768)
+            rounded = -32768;
+        
+        output[i] = (short)rounded;
+    }
+}
 
 DWORD WINAPI RecordingThread(LPVOID lpParam)
 {
     HWND hwnd = (HWND)lpParam;
     HRESULT hr;
+    float sessionPeak = 0.0f;  // Track peak across entire recording
+    DWORD lastMeterUpdate = 0;
+    const DWORD METER_UPDATE_INTERVAL = 50;  // Update meter every 50ms
 
     printf("Starting recording thread\n");
 
@@ -73,6 +159,8 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         hr = ctx.pCaptureClient->lpVtbl->GetNextPacketSize(ctx.pCaptureClient, &packetLength);
         if (FAILED(hr)) break;
 
+        float packetPeak = 0.0f;  // Track peak for this batch of packets
+
         while (packetLength != 0) {
             BYTE *pData;
             DWORD flags;
@@ -101,6 +189,12 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
                 memset(audioBuffer + capturedBytes, 0, totalBytes);
             } else {
                 memcpy(audioBuffer + capturedBytes, pData, totalBytes);
+                
+                // Calculate peak for this packet
+                int sampleCount = frameCount * ctx.pwfx->nChannels;
+                float peak = CalculatePeakLevel((float *)pData, sampleCount);
+                if (peak > packetPeak) packetPeak = peak;
+                if (peak > sessionPeak) sessionPeak = peak;
             }
             capturedBytes += totalBytes;
 
@@ -111,10 +205,23 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             if (FAILED(hr)) break;
         }
 
+        // Update the peak meter at regular intervals (not every packet)
+        DWORD now = GetTickCount();
+        if (now - lastMeterUpdate >= METER_UPDATE_INTERVAL) {
+            // Send peak value to GUI (multiply by 10000 to preserve precision as integer)
+            PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(packetPeak * 10000.0f), 0);
+            lastMeterUpdate = now;
+        }
+
         if (FAILED(hr)) break;
     }
 
     printf("Recording stopped. Captured %u bytes\n", capturedBytes);
+    printf("Session peak level: %.4f (%.1f dB)\n", sessionPeak, 
+           sessionPeak > 0 ? 20.0f * log10f(sessionPeak) : -96.0f);
+
+    // Send final peak reading
+    PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(sessionPeak * 10000.0f), 0);
 
     ctx.pAudioClient->lpVtbl->Stop(ctx.pAudioClient);
     CleanupAudioCapture(&ctx);
@@ -137,6 +244,12 @@ void PlayAudio(HWND hwnd)
     StopAudio();
     Sleep(RETRY_DELAY_MS);
 
+    // Calculate and display peak of captured buffer
+    float bufferPeak = CalculateBufferPeak(audioBuffer, capturedBytes);
+    printf("Playback buffer peak: %.4f (%.1f dB)\n", bufferPeak,
+           bufferPeak > 0 ? 20.0f * log10f(bufferPeak) : -96.0f);
+    PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(bufferPeak * 10000.0f), 0);
+
     int sampleCount = capturedBytes / sizeof(float);
     short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
     if (!convertedBuffer) {
@@ -144,18 +257,13 @@ void PlayAudio(HWND hwnd)
         return;
     }
 
-    float *floatData = (float *)audioBuffer;
-    for (int i = 0; i < sampleCount; ++i) {
-        float sample = floatData[i];
-        if (sample > 1.0f) sample = 1.0f;
-        if (sample < -1.0f) sample = -1.0f;
-        convertedBuffer[i] = (short)(sample * 32767);
-    }
+    // Use improved conversion with dithering
+    ConvertFloatTo16BitWithDither((float *)audioBuffer, convertedBuffer, sampleCount);
 
     playbackBufferSize = sampleCount * sizeof(short);
     playbackBuffer = (BYTE *)convertedBuffer;
 
-    printf("Converted %d samples for playback\n", sampleCount);
+    printf("Converted %d samples for playback (with TPDF dithering)\n", sampleCount);
 
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
@@ -276,42 +384,23 @@ void SaveAudio(HWND hwnd)
 
     StopAudio();
 
+    // Calculate and display peak of buffer being saved
+    float bufferPeak = CalculateBufferPeak(audioBuffer, capturedBytes);
+    printf("Saving buffer peak: %.4f (%.1f dB)\n", bufferPeak,
+           bufferPeak > 0 ? 20.0f * log10f(bufferPeak) : -96.0f);
+
     FILE *file = fopen("output.wav", "wb");
     if (!file) {
         MessageBox(hwnd, "Failed to open output.wav for writing", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    int sampleCount = capturedBytes / sizeof(float);
-    short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
-    if (!convertedBuffer) {
-        MessageBox(hwnd, "Failed to allocate memory for saving", "Error", MB_OK | MB_ICONERROR);
-        fclose(file);
-        return;
-    }
+    // Write 32-bit float WAV header - no conversion needed
+    DWORD dataSize = capturedBytes;
+    WriteWavHeaderFloat(file, g_nSamplesPerSec, g_nChannels, dataSize);
 
-    float *floatData = (float *)audioBuffer;
-    for (int i = 0; i < sampleCount; ++i) {
-        float sample = floatData[i];
-        if (sample > 1.0f) sample = 1.0f;
-        if (sample < -1.0f) sample = -1.0f;
-        convertedBuffer[i] = (short)(sample * 32767);
-    }
-
-    DWORD dataSize = sampleCount * sizeof(short);
-
-    WAVEFORMATEX wfx = {0};
-    wfx.wFormatTag = WAVE_FORMAT_PCM;
-    wfx.nChannels = g_nChannels;
-    wfx.nSamplesPerSec = g_nSamplesPerSec;
-    wfx.wBitsPerSample = 16;
-    wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-
-    WriteWavHeader(file, &wfx, dataSize);
-
-    size_t written = fwrite(convertedBuffer, 1, dataSize, file);
-    free(convertedBuffer);
+    // Write the raw float audio buffer directly - bit-perfect copy
+    size_t written = fwrite(audioBuffer, 1, dataSize, file);
 
     if (written != dataSize) {
         char errorMsg[256];
@@ -323,13 +412,16 @@ void SaveAudio(HWND hwnd)
 
     fclose(file);
 
-    printf("Audio saved successfully\n");
-    MessageBox(hwnd, "Audio saved successfully", "Success", MB_OK | MB_ICONINFORMATION);
+    printf("Audio saved successfully (32-bit float, lossless)\n");
+    MessageBox(hwnd, "Audio saved successfully (32-bit float)", "Success", MB_OK | MB_ICONINFORMATION);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     printf("Application started\n");
+
+    // Seed random number generator for dithering
+    srand((unsigned int)time(NULL));
 
     HWND hwnd = InitializeGUI(hInstance, nCmdShow);
     if (hwnd == NULL) {
@@ -361,7 +453,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         else if (msg.message == WM_USER + 3) // Play/Stop audio
         {
             printf("Received Play/Stop Audio message\n");
-if (!isPlaying)
+            if (!isPlaying)
             {
                 PlayAudio(hwnd);
             }
