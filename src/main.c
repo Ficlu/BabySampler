@@ -10,11 +10,20 @@
 #include "audio_save.h"
 #include "gui.h"
 #include "recording_list.h"
+#include "pitch_detect.h"
+#include "scale_detect.h"
 
 #define INITIAL_BUFFER_SIZE (1024 * 1024)  // Start with 1MB buffer
 #define BUFFER_GROWTH_FACTOR 2
 #define MAX_RETRY_COUNT 3
 #define RETRY_DELAY_MS 100
+
+// Fixed pitch analysis window size.
+// 4096 samples at 48kHz = ~85ms — long enough for ~6 full periods at 150Hz
+// (the lowest frequency we detect), which gives YIN plenty of data to work with.
+// Previously this was variable and could be as small as ~960 samples (20ms),
+// which was too short for reliable low-frequency detection.
+#define PITCH_WINDOW_SAMPLES 4096
 
 // State
 BOOL isRecording = FALSE;
@@ -80,33 +89,33 @@ void ConvertFloatTo16BitWithDither(const float *input, short *output, int sample
 {
     const float scale = 32767.0f;
     const float ditherAmp = 1.0f / scale;
-    
+
     for (int i = 0; i < sampleCount; i++)
     {
         float sample = input[i];
-        
+
         if (sample > 1.0f || sample < -1.0f)
         {
             sample = tanhf(sample);
         }
-        
+
         float newRandom = RandomFloat();
         float dither = (ditherState + newRandom) * ditherAmp;
         ditherState = newRandom;
-        
+
         float scaled = sample * scale + dither;
-        
+
         int32_t rounded;
         if (scaled >= 0.0f)
             rounded = (int32_t)(scaled + 0.5f);
         else
             rounded = (int32_t)(scaled - 0.5f);
-        
+
         if (rounded > 32767)
             rounded = 32767;
         else if (rounded < -32768)
             rounded = -32768;
-        
+
         output[i] = (short)rounded;
     }
 }
@@ -116,7 +125,9 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     HWND hwnd = (HWND)lpParam;
     HRESULT hr;
     DWORD lastMeterUpdate = 0;
+    DWORD lastPitchUpdate = 0;
     const DWORD METER_UPDATE_INTERVAL = 50;
+    const DWORD PITCH_DETECT_INTERVAL = 80;  // Run pitch detection every 80ms
 
     printf("Starting recording thread\n");
 
@@ -132,11 +143,34 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     tempChannels = ctx.pwfx->nChannels;
     printf("Capture format: channels=%d, sample rate=%lu\n", tempChannels, tempSampleRate);
 
+    // Initialize pitch detection (using instrument mode for broader compatibility)
+    PitchConfig pitchConfig;
+    PitchConfig_InitInstrument(&pitchConfig, tempSampleRate);
+
+    PitchTracker pitchTracker;
+    PitchTracker_Init(&pitchTracker);
+
+    ScaleAccumulator scaleAcc;
+    ScaleAccumulator_Init(&scaleAcc, tempSampleRate);
+
+    // Confidence output from YIN, used to weight scale histogram entries
+    float pitchConfidence = 0.0f;
+
+    // Fixed-size pitch analysis buffer.
+    // Using PITCH_WINDOW_SAMPLES (4096) gives ~85ms at 48kHz, which provides
+    // enough periods for reliable YIN detection down to 150Hz.
+    int pitchBufferSize = PITCH_WINDOW_SAMPLES;
+    float *pitchBuffer = (float*)malloc(pitchBufferSize * sizeof(float));
+    int pitchBufferPos = 0;
+
     tempBufferSize = INITIAL_BUFFER_SIZE;
     tempRecordBuffer = (BYTE*)malloc(tempBufferSize);
-    if (!tempRecordBuffer) {
+    if (!tempRecordBuffer || !pitchBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for audio buffer", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
+        if (tempRecordBuffer) free(tempRecordBuffer);
+        if (pitchBuffer) free(pitchBuffer);
+        tempRecordBuffer = NULL;
         isRecording = FALSE;
         UpdateRecordingStatus(hwnd, FALSE);
         return 1;
@@ -147,6 +181,7 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         MessageBox(hwnd, "Failed to start audio capture", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
         free(tempRecordBuffer);
+        free(pitchBuffer);
         tempRecordBuffer = NULL;
         isRecording = FALSE;
         UpdateRecordingStatus(hwnd, FALSE);
@@ -154,6 +189,8 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     }
 
     printf("Audio capture started\n");
+    printf("Pitch analysis window: %d samples (%.1f ms at %lu Hz)\n",
+           pitchBufferSize, 1000.0f * pitchBufferSize / tempSampleRate, tempSampleRate);
 
     tempCapturedBytes = 0;
     tempSessionPeak = 0.0f;
@@ -195,11 +232,22 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
                 memset(tempRecordBuffer + tempCapturedBytes, 0, totalBytes);
             } else {
                 memcpy(tempRecordBuffer + tempCapturedBytes, pData, totalBytes);
-                
+
                 int sampleCount = frameCount * ctx.pwfx->nChannels;
                 float peak = CalculatePeakLevel((float *)pData, sampleCount);
                 if (peak > packetPeak) packetPeak = peak;
                 if (peak > tempSessionPeak) tempSessionPeak = peak;
+
+                // Accumulate samples for pitch detection (downmix to mono)
+                float *floatData = (float *)pData;
+                for (UINT32 i = 0; i < frameCount && pitchBufferPos < pitchBufferSize; i++) {
+                    float mono = 0.0f;
+                    for (WORD ch = 0; ch < tempChannels; ch++) {
+                        mono += floatData[i * tempChannels + ch];
+                    }
+                    mono /= tempChannels;
+                    pitchBuffer[pitchBufferPos++] = mono;
+                }
             }
             tempCapturedBytes += totalBytes;
 
@@ -211,22 +259,73 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         }
 
         DWORD now = GetTickCount();
+
+        // Update peak meter
         if (now - lastMeterUpdate >= METER_UPDATE_INTERVAL) {
             PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(packetPeak * 10000.0f), 0);
             lastMeterUpdate = now;
+        }
+
+        // Run pitch detection when buffer is full.
+        // Uses 50% overlap: after processing, we shift the second half to the
+        // front and continue filling from there. This means each sample appears
+        // in two analysis windows, doubling detection opportunities and ensuring
+        // notes near window boundaries get at least one clean analysis pass.
+        if (now - lastPitchUpdate >= PITCH_DETECT_INTERVAL && pitchBufferPos >= pitchBufferSize) {
+            // Apply high-pass filter to kill mains hum.
+            // Cutoff at 100Hz removes 50/60Hz hum and harmonics while preserving
+            // the 150Hz+ detection range.
+            ApplyHighPassFilter(pitchBuffer, pitchBufferPos, tempSampleRate);
+
+            // NOTE: No Hanning window here. YIN's difference function is inherently
+            // self-windowing (it integrates over W = N/2), so an explicit window is
+            // redundant and actually harmful — it zeroes out the buffer edges,
+            // reducing the effective signal length by ~40% and making the cmndf
+            // noisier. The YIN paper does not use windowing.
+
+            int pitchClass = DetectPitchTracked(pitchBuffer, pitchBufferPos, &pitchConfig, &pitchTracker, &pitchConfidence);
+
+            if (pitchClass >= 0) {
+                ScaleAccumulator_AddPitch(&scaleAcc, pitchClass, pitchConfidence);
+            }
+
+            // 50% overlap: shift second half to front, continue filling from midpoint
+            int halfSize = pitchBufferSize / 2;
+            memmove(pitchBuffer, pitchBuffer + halfSize, halfSize * sizeof(float));
+            pitchBufferPos = halfSize;
+            lastPitchUpdate = now;
         }
 
         if (FAILED(hr)) break;
     }
 
     printf("Recording stopped. Captured %lu bytes\n", tempCapturedBytes);
-    printf("Session peak level: %.4f (%.1f dB)\n", tempSessionPeak, 
+    printf("Session peak level: %.4f (%.1f dB)\n", tempSessionPeak,
            tempSessionPeak > 0 ? 20.0f * log10f(tempSessionPeak) : -96.0f);
+
+    // Analyze scale
+    ScaleResult scaleResult = ScaleAccumulator_Analyze(&scaleAcc);
+    char scaleName[32];
+    ScaleResult_GetName(&scaleResult, scaleName, sizeof(scaleName));
+    printf("Detected scale: %s (confidence: %.2f, notes: %d)\n",
+           scaleName, scaleResult.confidence, scaleResult.totalNotes);
+
+    // Print pitch histogram for debugging (now confidence-weighted)
+    printf("Pitch histogram: ");
+    const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    for (int i = 0; i < 12; i++) {
+        if (scaleAcc.histogram[i] > 0.0f) {
+            printf("%s:%.1f ", noteNames[i], scaleAcc.histogram[i]);
+        }
+    }
+    printf("(total weight: %.1f from %d detections)\n", scaleAcc.totalWeight, scaleAcc.totalCount);
 
     PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(tempSessionPeak * 10000.0f), 0);
 
     ctx.pAudioClient->lpVtbl->Stop(ctx.pAudioClient);
     CleanupAudioCapture(&ctx);
+
+    free(pitchBuffer);
 
     // Add the recording to the list (if we captured anything)
     if (tempCapturedBytes > 0 && tempRecordBuffer) {
@@ -235,13 +334,11 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         if (finalBuffer) {
             tempRecordBuffer = finalBuffer;
         }
-        // else keep original buffer, just slightly wasteful
-        
+
         int index = RecordingList_Add(&recordings, tempRecordBuffer, tempCapturedBytes,
-                                      tempSampleRate, tempChannels, tempSessionPeak);
+                                      tempSampleRate, tempChannels, tempSessionPeak, &scaleResult);
         if (index >= 0) {
             printf("Added recording %d to list\n", index + 1);
-            // Don't free tempRecordBuffer - ownership transferred to list
             tempRecordBuffer = NULL;
         } else {
             printf("Failed to add recording to list\n");
@@ -271,7 +368,7 @@ void PlayAudio(HWND hwnd)
         MessageBox(hwnd, "No recording selected", "Error", MB_OK | MB_ICONERROR);
         return;
     }
-    
+
     if (selCount > 1) {
         MessageBox(hwnd, "Select a single recording for playback", "Info", MB_OK | MB_ICONINFORMATION);
         return;
@@ -420,7 +517,7 @@ void SaveAudio(HWND hwnd)
 
     int selCount = 0;
     int *indices = GetSelectedRecordingIndices(hwnd, &selCount);
-    
+
     if (selCount == 0 || !indices) {
         MessageBox(hwnd, "No recordings selected", "Error", MB_OK | MB_ICONERROR);
         return;
@@ -473,7 +570,7 @@ void SaveAudio(HWND hwnd)
     // Show summary
     char msg[256];
     if (failedCount == 0) {
-        snprintf(msg, sizeof(msg), "Saved %d recording%s (32-bit float)", 
+        snprintf(msg, sizeof(msg), "Saved %d recording%s (32-bit float)",
                  savedCount, savedCount == 1 ? "" : "s");
         MessageBox(hwnd, msg, "Success", MB_OK | MB_ICONINFORMATION);
     } else {
@@ -488,7 +585,7 @@ void DeleteRecording(HWND hwnd)
 
     int selCount = 0;
     int *indices = GetSelectedRecordingIndices(hwnd, &selCount);
-    
+
     if (selCount == 0 || !indices) {
         MessageBox(hwnd, "No recordings selected", "Error", MB_OK | MB_ICONERROR);
         return;
@@ -612,7 +709,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Free resources before exiting
     RecordingList_Free(&recordings);
-    
+
     if (playbackBuffer) {
         free(playbackBuffer);
         playbackBuffer = NULL;

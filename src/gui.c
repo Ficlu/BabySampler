@@ -120,7 +120,7 @@ void CreateGUIControls(HWND hwnd)
     // Recording list (extended selection for Ctrl+click, Shift+click)
     hRecordingList = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL,
                                     WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL,
-                                    10, y, 300, 100, hwnd,
+                                    10, y, 360, 100, hwnd,
                                     (HMENU)ID_RECORDING_LIST, NULL, NULL);
     y += 108;
 
@@ -195,7 +195,7 @@ void RefreshRecordingList(HWND hwnd, RecordingList *list)
 
     // Add all recordings
     for (int i = 0; i < list->count; i++) {
-        char entry[64];
+        char entry[80];
         RecordingList_FormatEntry(&list->items[i], i, entry, sizeof(entry));
         SendMessage(hRecordingList, LB_ADDSTRING, 0, (LPARAM)entry);
     }
@@ -288,13 +288,13 @@ HWND InitializeGUI(HINSTANCE hInstance, int nCmdShow)
 
     RegisterClass(&wc);
 
-    // Taller window to fit the recording list
+    // Taller and wider window to fit the recording list with scale info
     HWND hwnd = CreateWindowEx(
         0,
         WINDOW_CLASS_NAME,
         "Audio Sampler",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 340, 360,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 360,
         NULL,
         NULL,
         hInstance,

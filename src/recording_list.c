@@ -1,7 +1,9 @@
 // recording_list.c
 #include "recording_list.h"
+#include "scale_detect.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #define INITIAL_CAPACITY 8
@@ -32,7 +34,8 @@ void RecordingList_Free(RecordingList *list)
 }
 
 int RecordingList_Add(RecordingList *list, BYTE *buffer, DWORD size,
-                      DWORD sampleRate, WORD channels, float peakLevel)
+                      DWORD sampleRate, WORD channels, float peakLevel,
+                      const ScaleResult *scale)
 {
     // Grow array if needed
     if (list->count >= list->capacity) {
@@ -64,6 +67,15 @@ int RecordingList_Add(RecordingList *list, BYTE *buffer, DWORD size,
     rec->peakLevel = peakLevel;
     rec->duration = duration;
     GetLocalTime(&rec->timestamp);
+    
+    // Copy scale result
+    if (scale) {
+        rec->scale = *scale;
+    } else {
+        memset(&rec->scale, 0, sizeof(ScaleResult));
+        rec->scale.rootNote = -1;
+        rec->scale.scaleType = SCALE_UNKNOWN;
+    }
 
     list->count++;
 
@@ -127,14 +139,32 @@ DWORD RecordingList_GetTotalMemory(RecordingList *list)
 
 void RecordingList_FormatEntry(AudioRecording *rec, int index, char *buffer, int bufferSize)
 {
-    // Format: "1. 14:32:05 - 12.3s (-3.2 dB)"
+    // Format: "1. 14:32:05 - 12.3s (-3.2 dB) [Am 87%]"
     float peakDb = rec->peakLevel > 0 ? 20.0f * log10f(rec->peakLevel) : -96.0f;
     
-    snprintf(buffer, bufferSize, "%d. %02d:%02d:%02d - %.1fs (%.1f dB)",
-             index + 1,
-             rec->timestamp.wHour,
-             rec->timestamp.wMinute,
-             rec->timestamp.wSecond,
-             rec->duration,
-             peakDb);
+    char scaleName[16];
+    ScaleResult_GetShortName(&rec->scale, scaleName, sizeof(scaleName));
+    
+    // Show confidence as percentage if we have a valid scale
+    if (rec->scale.scaleType != SCALE_UNKNOWN && rec->scale.confidence > 0) {
+        int confidencePct = (int)(rec->scale.confidence * 100.0f + 0.5f);
+        snprintf(buffer, bufferSize, "%d. %02d:%02d:%02d - %.1fs (%.1f dB) [%s %d%%]",
+                 index + 1,
+                 rec->timestamp.wHour,
+                 rec->timestamp.wMinute,
+                 rec->timestamp.wSecond,
+                 rec->duration,
+                 peakDb,
+                 scaleName,
+                 confidencePct);
+    } else {
+        snprintf(buffer, bufferSize, "%d. %02d:%02d:%02d - %.1fs (%.1f dB) [%s]",
+                 index + 1,
+                 rec->timestamp.wHour,
+                 rec->timestamp.wMinute,
+                 rec->timestamp.wSecond,
+                 rec->duration,
+                 peakDb,
+                 scaleName);
+    }
 }

@@ -3,6 +3,7 @@
 #define RECORDING_LIST_H
 
 #include <windows.h>
+#include "scale_detect.h"
 
 typedef struct {
     BYTE *buffer;
@@ -12,6 +13,7 @@ typedef struct {
     SYSTEMTIME timestamp; // when it was recorded
     float peakLevel;      // for display
     float duration;       // in seconds
+    ScaleResult scale;    // detected scale
 } AudioRecording;
 
 typedef struct {
@@ -30,7 +32,8 @@ void RecordingList_Free(RecordingList *list);
 // Add a new recording (takes ownership of buffer - don't free it after calling)
 // Returns the index of the new recording, or -1 on failure
 int RecordingList_Add(RecordingList *list, BYTE *buffer, DWORD size,
-                      DWORD sampleRate, WORD channels, float peakLevel);
+                      DWORD sampleRate, WORD channels, float peakLevel,
+                      const ScaleResult *scale);
 
 // Remove a recording at index and free its buffer
 // Returns TRUE on success, FALSE if index is invalid
@@ -46,7 +49,7 @@ AudioRecording* RecordingList_GetSelected(RecordingList *list);
 DWORD RecordingList_GetTotalMemory(RecordingList *list);
 
 // Format a recording entry for display in listbox
-// Buffer should be at least 64 chars
+// Buffer should be at least 80 chars
 void RecordingList_FormatEntry(AudioRecording *rec, int index, char *buffer, int bufferSize);
 
 #endif // RECORDING_LIST_H

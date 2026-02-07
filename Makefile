@@ -13,7 +13,7 @@ INCLUDEDIR = include
 TARGET = $(BINDIR)/babysampler
 
 # Object files
-OBJS = $(OBJDIR)/audio_capture.o $(OBJDIR)/audio_save.o $(OBJDIR)/main.o $(OBJDIR)/recording_list.o $(OBJDIR)/gui.o
+OBJS = $(OBJDIR)/audio_capture.o $(OBJDIR)/audio_save.o $(OBJDIR)/main.o $(OBJDIR)/recording_list.o $(OBJDIR)/gui.o $(OBJDIR)/pitch_detect.o $(OBJDIR)/scale_detect.o
 
 # Default rule to build everything
 all: $(TARGET)
@@ -41,8 +41,17 @@ $(OBJDIR)/recording_list.o: $(SRCDIR)/recording_list.c $(SRCDIR)/recording_list.
 	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/recording_list.c -o $(OBJDIR)/recording_list.o
 
 $(OBJDIR)/gui.o: $(SRCDIR)/gui.c $(SRCDIR)/gui.h
-	@echo "Compiling .c into gui.o"
+	@echo "Compiling gui.c into gui.o"
+
 	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/gui.c -o $(OBJDIR)/gui.o
+$(OBJDIR)/pitch_detect.o: $(SRCDIR)/pitch_detect.c $(SRCDIR)/pitch_detect.h
+	@echo "Compiling pitch_detect.c into pitch_detect.o"
+	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/pitch_detect.c -o $(OBJDIR)/pitch_detect.o
+
+$(OBJDIR)/scale_detect.o: $(SRCDIR)/scale_detect.c $(SRCDIR)/scale_detect.h
+	@echo "Compiling scale_detect.c into scale_detect.o"
+	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/scale_detect.c -o $(OBJDIR)/scale_detect.o
+
 
 # Create the necessary directories
 $(OBJDIR):
