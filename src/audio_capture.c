@@ -5,7 +5,6 @@
 #include <stdio.h>
 
 #include "audio_capture.h"
-#include "audio_save.h"
 
 HRESULT InitializeAudioCapture(AudioCaptureContext *ctx) {
     HRESULT hr;
@@ -80,78 +79,7 @@ HRESULT StartAudioCapture(AudioCaptureContext *ctx) {
     return ctx->pAudioClient->lpVtbl->Start(ctx->pAudioClient);
 }
 
-HRESULT CaptureAudioData(AudioCaptureContext *ctx) {
-    HRESULT hr;
-    UINT32 packetLength = 0;
-    BYTE *pData;
-    DWORD flags;
-    int capturing = 1;
-
-    while (capturing) {
-        // Sleep for a while
-        Sleep(20);
-
-        // Get the available data size
-        hr = ctx->pCaptureClient->lpVtbl->GetNextPacketSize(ctx->pCaptureClient, &packetLength);
-        if (FAILED(hr)) break;
-
-        while (packetLength != 0) {
-            // Get the captured data
-            hr = ctx->pCaptureClient->lpVtbl->GetBuffer(ctx->pCaptureClient, &pData, &packetLength, &flags, NULL, NULL);
-            if (FAILED(hr)) break;
-
-            UINT32 frameCount = packetLength;
-            UINT32 bytesPerFrame = ctx->blockAlign;
-            UINT32 totalBytes = frameCount * bytesPerFrame;
-
-            // Handle silence (write zeros if the buffer is silent)
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                memset(pData, 0, totalBytes);
-            }
-
-            // Convert 32-bit float to 16-bit PCM
-            if (ctx->pwfx->wBitsPerSample == 32) {
-                int sampleCount = frameCount * ctx->pwfx->nChannels;
-                short *convertedBuffer = (short *)malloc(sampleCount * sizeof(short));
-                float *floatData = (float *)pData;
-
-                for (int i = 0; i < sampleCount; ++i) {
-                    float sample = floatData[i];
-                    if (sample > 1.0f) sample = 1.0f;
-                    if (sample < -1.0f) sample = -1.0f;
-                    convertedBuffer[i] = (short)(sample * 32767);
-                }
-
-                // Write 16-bit PCM data to file
-                fwrite(convertedBuffer, sizeof(short), sampleCount, ctx->file);
-                ctx->dataLength += sampleCount * sizeof(short);
-
-                free(convertedBuffer);
-            } else {
-                // Write directly if 16-bit PCM
-                fwrite(pData, totalBytes, 1, ctx->file);
-                ctx->dataLength += totalBytes;
-            }
-
-            // Release the buffer
-            hr = ctx->pCaptureClient->lpVtbl->ReleaseBuffer(ctx->pCaptureClient, frameCount);
-            if (FAILED(hr)) break;
-
-            // Get the next packet size
-            hr = ctx->pCaptureClient->lpVtbl->GetNextPacketSize(ctx->pCaptureClient, &packetLength);
-            if (FAILED(hr)) break;
-        }
-
-        // Check for user interrupt (Ctrl+C)
-        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-            if (GetAsyncKeyState('C') & 0x8000) {
-                capturing = 0;
-            }
-        }
-    }
-
-    // Stop recording
-    ctx->pAudioClient->lpVtbl->Stop(ctx->pAudioClient);
-
-    return hr;
-}
+// Note: The capture loop is implemented in RecordingThread() in main.c,
+// which handles ring-buffered analysis alongside raw audio storage.
+// StartAudioCapture() starts the WASAPI stream; the caller is responsible
+// for calling GetBuffer/ReleaseBuffer in its own loop.

@@ -1,34 +1,22 @@
 // chromagram.c
 //
-// HPCP with Instantaneous Frequency (IF) refinement and harmonic folding.
+// HPCP with three refinements:
+//   1. Instantaneous Frequency via phase derivative (sub-Hz accuracy)
+//   2. Harmonic folding (attributes harmonics back to fundamentals)
+//   3. Spectral whitening (suppresses sidelobe false peaks)
 //
-// Two refinements over basic HPCP:
+// Pipeline:
+//   FFT → magnitude spectrum → spectral envelope (moving average)
+//   → whitened spectrum (mag / envelope) → peak detection on whitened
+//   → IF refinement using raw phase → harmonic folding using raw energy
+//   → pitch class accumulation
 //
-// 1. IF estimation (Kodera 1976, Auger & Flandrin 1995):
-//    For each spectral peak, we compare FFT phase between frames.
-//    A pure sinusoid at frequency f causes bin k's phase to advance by:
-//        expected = 2π × k × H / N
-//    Deviation from this reveals the true frequency:
-//        IF[k] = f_k + unwrap(actual - expected) × Fs / (2π × H)
-//    This gives sub-Hz precision at all frequencies.
-//
-// 2. Harmonic folding (Gómez 2006):
-//    Each spectral peak at frequency f might be:
-//      - A fundamental at f         (h=1, weight 1.0)
-//      - The 2nd harmonic of f/2    (h=2, weight λ)
-//      - The 3rd harmonic of f/3    (h=3, weight λ²)
-//      - ...
-//    We distribute each peak's energy across all candidate fundamentals
-//    with exponential decay λ^(h-1). This folds harmonic series energy
-//    back toward the fundamental pitch class.
-//
-//    Why this matters: a C3 note with harmonics produces peaks at C3,
-//    C4, G4, C5, E5, G5, Bb5... Without folding, G4 and E5 pollute
-//    the G and E pitch classes. With folding, these peaks attribute
-//    most of their energy back to C (via h=3 and h=5 hypotheses).
+// Whitening only affects WHICH bins are identified as peaks.
+// Energy calculation uses raw magnitudes so the chromagram reflects
+// actual signal energy, not the normalized values.
 //
 // References:
-//   - Gómez, "Tonal Description of Music Audio Signals" (2006), §3.2
+//   - Gómez, "Tonal Description of Music Audio Signals" (2006)
 //   - Müller, "Fundamentals of Music Processing" (2015), §8.2.1
 //   - Kodera, Gendrin & de Villedary, Phys. Earth Planet. Inter. (1976)
 //   - Auger & Flandrin, IEEE TSP (1995)
@@ -118,6 +106,13 @@ BOOL ChromagramContext_Init(ChromagramContext *ctx, int fftSize, int hopSize)
     ctx->specSize = specSize;
     ctx->hopSize = hopSize;
     ctx->hasPrev = FALSE;
+
+    // Initialize tuning estimation state
+    memset(ctx->tuningHistogram, 0, sizeof(ctx->tuningHistogram));
+    ctx->tuningPeakCount = 0;
+    ctx->tuningOffsetCents = 0.0f;
+    ctx->tuningLocked = FALSE;
+
     return TRUE;
 }
 
@@ -129,7 +124,76 @@ void ChromagramContext_Free(ChromagramContext *ctx)
     ctx->hasPrev = FALSE;
 }
 
-// ---- HPCP with IF refinement and harmonic folding ----
+// ---- Tuning estimation ----
+//
+// Finds the global tuning offset by analyzing the distribution of
+// fractional-semitone offsets across all detected spectral peaks.
+//
+// Approach: each peak's frequency maps to some fractional semitone
+// value. The fractional part (how far the peak is from the nearest
+// integer semitone) reveals the tuning offset. If the source is
+// tuned to A=442, every peak will be ~+8 cents sharp, and the
+// histogram of offsets will peak at +8.
+//
+// We smooth the histogram to suppress noise, then find its maximum.
+// The result is the estimated tuning offset in cents.
+//
+// Ref: Gomez (2006) section 3.1; Essentia TuningFrequency algorithm
+
+float EstimateTuning(ChromagramContext *ctx)
+{
+    if (!ctx || ctx->tuningPeakCount < HPCP_TUNING_MIN_PEAKS) {
+        return 0.0f;  // Not enough data — assume 440 Hz
+    }
+
+    // Smooth the tuning histogram with a moving average
+    float smoothed[HPCP_TUNING_BINS];
+    for (int i = 0; i < HPCP_TUNING_BINS; i++) {
+        float sum = 0.0f;
+        int count = 0;
+        for (int j = -HPCP_TUNING_SMOOTH; j <= HPCP_TUNING_SMOOTH; j++) {
+            int idx = i + j;
+            if (idx >= 0 && idx < HPCP_TUNING_BINS) {
+                sum += ctx->tuningHistogram[idx];
+                count++;
+            }
+        }
+        smoothed[i] = sum / (float)count;
+    }
+
+    // Find the peak of the smoothed histogram
+    int bestBin = 50;  // center = 0 cents offset
+    float bestVal = smoothed[50];
+    for (int i = 0; i < HPCP_TUNING_BINS; i++) {
+        if (smoothed[i] > bestVal) {
+            bestVal = smoothed[i];
+            bestBin = i;
+        }
+    }
+
+    // Parabolic interpolation for sub-cent accuracy
+    float offsetCents = (float)(bestBin - 50);  // raw bin to cents
+    if (bestBin > 0 && bestBin < HPCP_TUNING_BINS - 1) {
+        float s0 = smoothed[bestBin - 1];
+        float s1 = smoothed[bestBin];
+        float s2 = smoothed[bestBin + 1];
+        float denom = 2.0f * (2.0f * s1 - s0 - s2);
+        if (fabsf(denom) > 0.0001f) {
+            float delta = (s0 - s2) / denom;
+            if (fabsf(delta) < 1.0f) {
+                offsetCents += delta;
+            }
+        }
+    }
+
+    // Commit the result
+    ctx->tuningOffsetCents = offsetCents;
+    ctx->tuningLocked = TRUE;
+
+    return offsetCents;
+}
+
+// ---- HPCP with IF refinement, harmonic folding, and spectral whitening ----
 
 Chromagram ComputeHPCP(ChromagramContext *ctx,
                        const float *samples, int sampleCount, DWORD sampleRate)
@@ -141,6 +205,14 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
     float sr = (float)sampleRate;
     float freqRes = sr / (float)sampleCount;
     int N = sampleCount;
+
+    // Use tuning-corrected reference frequency if available.
+    // Before tuning is locked, we use the default 440 Hz and accumulate
+    // offset data. Once locked, we shift the reference to compensate.
+    float refFreq = HPCP_REF_FREQ;
+    if (ctx != NULL && ctx->tuningLocked) {
+        refFreq = HPCP_REF_FREQ * powf(2.0f, ctx->tuningOffsetCents / 1200.0f);
+    }
 
     float *fftData = (float *)malloc(2 * N * sizeof(float));
     if (!fftData) return result;
@@ -160,10 +232,20 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
     FFT(fftData, N);
 
     int specSize = N / 2;
-    float *mag = (float *)malloc(specSize * sizeof(float));
-    if (!mag) { free(fftData); return result; }
 
-    // Extract magnitude
+    // Allocate working arrays: raw magnitude, envelope, whitened magnitude
+    float *mag      = (float *)malloc(specSize * sizeof(float));
+    float *envelope  = (float *)malloc(specSize * sizeof(float));
+    float *whitened  = (float *)malloc(specSize * sizeof(float));
+    if (!mag || !envelope || !whitened) {
+        free(fftData);
+        if (mag) free(mag);
+        if (envelope) free(envelope);
+        if (whitened) free(whitened);
+        return result;
+    }
+
+    // ---- Extract raw magnitudes ----
     float maxMag = 0.0f;
     for (int i = 0; i < specSize; i++) {
         float re = fftData[2*i], im = fftData[2*i+1];
@@ -171,62 +253,135 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
         if (mag[i] > maxMag) maxMag = mag[i];
     }
 
-    // Two-level thresholding
+    // ---- Spectral whitening: compute moving-average envelope ----
+    //
+    // For each bin i, envelope[i] = mean(mag[i-W .. i+W]) where W is
+    // HPCP_WHITEN_HALF_WINDOW. We use a running sum for O(N) efficiency.
+    //
+    // Why moving average rather than moving median:
+    //   - O(N) vs O(N·W·log W) computational cost
+    //   - A single peak in an 81-bin window contributes ~10% to the mean,
+    //     so it doesn't inflate its own envelope much
+    //   - For our purposes (sidelobe suppression), this is sufficient;
+    //     moving median would be slightly more robust but not worth the cost
+    {
+        int halfWin = HPCP_WHITEN_HALF_WINDOW;
+        float runSum = 0.0f;
+        int winCount = 0;
+
+        // Seed: sum elements [0 .. halfWin]
+        for (int i = 0; i <= halfWin && i < specSize; i++) {
+            runSum += mag[i];
+            winCount++;
+        }
+        envelope[0] = runSum / (float)winCount;
+
+        for (int i = 1; i < specSize; i++) {
+            // Add new element entering window on the right
+            int addIdx = i + halfWin;
+            if (addIdx < specSize) {
+                runSum += mag[addIdx];
+                winCount++;
+            }
+            // Remove element leaving window on the left
+            int removeIdx = i - halfWin - 1;
+            if (removeIdx >= 0) {
+                runSum -= mag[removeIdx];
+                winCount--;
+            }
+            envelope[i] = runSum / (float)winCount;
+        }
+    }
+
+    // ---- Compute whitened magnitudes ----
+    //
+    // whitened[i] = mag[i] / envelope[i]
+    //
+    // A genuine spectral peak will have whitened value >> 1.0 (it stands
+    // well above the local average). A sidelobe or noise floor bin will
+    // have whitened value ≈ 1.0 (it's at the local average level).
+    //
+    // The floor prevents division by zero in silent regions. We use a
+    // tiny fraction of the global max so the floor scales with signal level.
+    {
+        float envFloor = maxMag * 1e-6f;
+        if (envFloor < 1e-20f) envFloor = 1e-20f;
+
+        for (int i = 0; i < specSize; i++) {
+            float env = envelope[i] > envFloor ? envelope[i] : envFloor;
+            whitened[i] = mag[i] / env;
+        }
+    }
+
+    // ---- Raw magnitude thresholds (unchanged from before) ----
+    //
+    // Two-level threshold on raw magnitudes: absolute noise floor and
+    // relative-to-max floor. A bin must exceed both to be a candidate.
     float magSum = 0.0f;
     for (int i = 0; i < specSize; i++) magSum += mag[i];
     float noiseFloor = (magSum / (float)specSize) * 0.1f;
-    float relFloor = maxMag * HPCP_RELATIVE_THRESHOLD;
-    float threshold = noiseFloor > relFloor ? noiseFloor : relFloor;
+    float relFloor   = maxMag * HPCP_RELATIVE_THRESHOLD;
+    float rawThreshold = noiseFloor > relFloor ? noiseFloor : relFloor;
 
     // Precompute: can we use IF estimation this frame?
     BOOL useIF = (ctx != NULL && ctx->hasPrev &&
                   ctx->specSize == specSize && ctx->hopSize > 0);
 
-    // Expected phase advance per bin per hop (radians)
     float phaseAdvancePerBin = 0.0f;
     if (useIF) {
         phaseAdvancePerBin = 2.0f * (float)M_PI * (float)ctx->hopSize / (float)N;
     }
 
-    // ---- Precompute harmonic weights ----
-    //
-    // harmonicWeight[h] = λ^h  (note: array is 0-indexed, h=0 means harmonic 1)
-    // harmonicWeight[0] = 1.0 (fundamental)
-    // harmonicWeight[1] = λ   (2nd harmonic)
-    // harmonicWeight[2] = λ²  (3rd harmonic)
-    // ...
+    // Precompute harmonic weights: harmonicWeight[h] = λ^h (0-indexed)
     float harmonicWeight[HPCP_MAX_HARMONIC];
     harmonicWeight[0] = 1.0f;
     for (int h = 1; h < HPCP_MAX_HARMONIC; h++) {
         harmonicWeight[h] = harmonicWeight[h - 1] * HPCP_HARMONIC_DECAY;
     }
 
-    // ---- Peak search range ----
+    // ---- Peak detection and mapping ----
     //
-    // minBin: lowest frequency we care about as a fundamental.
-    // maxBin: highest frequency at which we search for peaks.
+    // A bin is accepted as a spectral peak if ALL of these hold:
+    //   1. Raw magnitude > rawThreshold           (noise gate)
+    //   2. Whitened local maximum                  (genuine peak shape)
+    //   3. Whitened magnitude > WHITEN_PEAK_THRESHOLD  (stands out from local floor)
     //
-    // We scan up to HPCP_MAX_PEAK_FREQ (not HPCP_MAX_FUNDAMENTAL_FREQ)
-    // because peaks above the fundamental range can still be harmonics
-    // of notes within the fundamental range.
+    // Gate 1 eliminates silence and broadband noise.
+    // Gates 2-3 eliminate sidelobe artifacts that pass gate 1 by riding
+    // on a strong neighbor's skirt. After whitening, the neighbor's skirt
+    // is flat (envelope-normalized), so only bins with genuine spectral
+    // content survive.
     //
-    // Example: a peak at 3000 Hz could be the 3rd harmonic of A5 (880 Hz)
-    // → candidate fundamental at 1000 Hz → maps to pitch class.
-    // Without extending the range, we'd miss this harmonic energy entirely.
+    // Once accepted, raw magnitude is used for energy calculation.
+
     int minBin = (int)(HPCP_MIN_FUNDAMENTAL_FREQ / freqRes);
     int maxBin = (int)(HPCP_MAX_PEAK_FREQ / freqRes);
     if (minBin < 1) minBin = 1;
     if (maxBin >= specSize - 1) maxBin = specSize - 2;
 
+    int peakCount = 0;
+
     for (int bin = minBin; bin <= maxBin; bin++) {
-        if (mag[bin] <= threshold) continue;
-        if (mag[bin] < mag[bin-1] || mag[bin] < mag[bin+1]) continue;
+        // Gate 1: raw magnitude noise floor
+        if (mag[bin] <= rawThreshold) continue;
+
+        // Gate 2: local maximum in whitened spectrum
+        if (whitened[bin] <= whitened[bin - 1] || whitened[bin] <= whitened[bin + 1])
+            continue;
+
+        // Gate 3: whitened magnitude must stand out from local average
+        if (whitened[bin] < HPCP_WHITEN_PEAK_THRESHOLD) continue;
+
+        peakCount++;
+
+        // ---- Frequency estimation ----
+        // IF estimation uses raw FFT phase (whitening doesn't affect phase).
+        // Energy uses raw magnitude (whitening is only for peak gating).
 
         float freq;
         float peakMag = mag[bin];
 
         if (useIF) {
-            // ---- Instantaneous Frequency estimation ----
             float curReal = fftData[2*bin];
             float curImag = fftData[2*bin+1];
             float curPhase = atan2f(curImag, curReal);
@@ -240,10 +395,10 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
 
             freq = (float)bin * freqRes + freqOffset;
 
-            // Sanity check: IF estimate should be within ±0.6 bins of peak
+            // Sanity check: IF within ±0.6 bins of peak center
             float binFreq = (float)bin * freqRes;
             if (freq < binFreq - 0.6f * freqRes || freq > binFreq + 0.6f * freqRes) {
-                // IF estimate unreliable — fall back to parabolic
+                // IF unreliable — fall back to parabolic interpolation
                 freq = binFreq;
                 float alpha = mag[bin-1], beta = mag[bin], gamma = mag[bin+1];
                 float denom = alpha - 2.0f*beta + gamma;
@@ -256,7 +411,7 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
                 }
             }
         } else {
-            // ---- Parabolic interpolation fallback (first frame) ----
+            // Parabolic interpolation fallback (first frame)
             freq = (float)bin * freqRes;
             float alpha = mag[bin-1], beta = mag[bin], gamma = mag[bin+1];
             float denom = alpha - 2.0f*beta + gamma;
@@ -269,69 +424,85 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
             }
         }
 
-        // Reject peaks outside the extended detection range.
-        // Peaks below MIN_FUNDAMENTAL can't be a valid fundamental or
-        // a useful harmonic of anything in range. Peaks above MAX_PEAK
-        // are beyond where we expect musically relevant harmonics.
+        // Reject peaks outside detection range after interpolation
         if (freq < HPCP_MIN_FUNDAMENTAL_FREQ || freq > HPCP_MAX_PEAK_FREQ)
             continue;
 
-        // Squared magnitude (energy) for this peak
+        // Raw energy for this peak
         float energy = peakMag * peakMag;
 
-        // ---- Harmonic folding (Gómez 2006, §3.2) ----
-        //
-        // For this peak at frequency `freq`, test each harmonic hypothesis:
-        //
-        //   h=1: this peak IS a fundamental at freq        → weight 1.0
-        //   h=2: this peak is harmonic 2 of fund at freq/2 → weight λ
-        //   h=3: this peak is harmonic 3 of fund at freq/3 → weight λ²
-        //   ...
-        //
-        // Each hypothesis produces a candidate fundamental frequency.
-        // If that candidate falls within the valid fundamental range,
-        // we map it to a pitch class and add weighted energy.
-        //
-        // The result: if a C3 note produces harmonic peaks at G4 (3rd),
-        // E5 (5th), etc., those peaks contribute energy back to pitch
-        // class C with weights 0.36 and 0.13 respectively. Without
-        // folding, they'd pollute G and E pitch classes instead.
-        //
-        // Note: candidateFreq decreases as h increases, so once it
-        // drops below MIN_FUNDAMENTAL we can stop (all higher h values
-        // will be even lower).
+        // ---- Tuning offset accumulation ----
+        // Record each peak's fractional-semitone offset from the nearest
+        // integer semitone (relative to the default 440 Hz reference).
+        // This data is used by EstimateTuning() to find the global tuning
+        // offset. We only accumulate before tuning is locked; afterward,
+        // the corrected refFreq already accounts for the offset.
+        if (ctx != NULL && !ctx->tuningLocked) {
+            float semi440 = 12.0f * log2f(freq / HPCP_REF_FREQ);
+            float fractional = semi440 - roundf(semi440);  // -0.5 to +0.5 semitones
+            int centOffset = (int)roundf(fractional * 100.0f);  // convert to cents
+            // Clamp to histogram range
+            if (centOffset >= -50 && centOffset <= 50) {
+                int histBin = centOffset + 50;  // map [-50,+50] to [0,100]
+                ctx->tuningHistogram[histBin] += energy;
+                ctx->tuningPeakCount++;
+            }
+        }
 
+        // ---- Harmonic folding with cosine-weighted bin assignment ----
+        //
+        // Each spectral peak at frequency f is attributed to candidate
+        // fundamentals f/1, f/2, ..., f/H with exponentially decaying
+        // weights. Each candidate's energy is then distributed between
+        // the two nearest pitch classes using a raised cosine kernel
+        // instead of hard rounding.
+        //
+        // The cosine kernel ensures that a peak exactly between two
+        // pitch classes splits its energy 50/50, while a peak exactly
+        // on a pitch class contributes 100% to that class. This
+        // eliminates the quantization cliff where a 1-cent shift could
+        // move 100% of energy from one bin to another.
         for (int h = 0; h < HPCP_MAX_HARMONIC; h++) {
             float candidateFreq = freq / (float)(h + 1);
 
-            // Candidate below valid range — done (further h only go lower)
             if (candidateFreq < HPCP_MIN_FUNDAMENTAL_FREQ)
                 break;
 
-            // Candidate above valid fundamental range — skip this h,
-            // but lower h values (higher divisor) may bring it in range.
-            // This happens when the peak is between MAX_FUNDAMENTAL and
-            // MAX_PEAK — it only contributes via h >= 2 hypotheses.
             if (candidateFreq > HPCP_MAX_FUNDAMENTAL_FREQ)
                 continue;
 
-            // Map candidate fundamental to pitch class
-            //
-            // semi = number of semitones from A4 (440 Hz)
-            // pc = pitch class 0-11 where C=0, C#=1, ..., B=11
-            //
-            // The +9 shifts from A-relative to C-relative:
-            //   A is 0 semitones from A4, and A = pitch class 9
-            //   so (0 + 9) % 12 = 9 ✓
-            //   C is -9 semitones from A4 (or +3), (3 + 9) % 12 = 0 ✓
-            float semi = 12.0f * log2f(candidateFreq / HPCP_REF_FREQ);
-            int pc = (((int)roundf(semi) + 9) % 12 + 12) % 12;
-
+            float semi = 12.0f * log2f(candidateFreq / refFreq);
             float contribution = harmonicWeight[h] * energy;
-            result.bins[pc] += contribution;
-            result.totalEnergy += contribution;
+
+            // Cosine-weighted distribution between two nearest pitch classes.
+            // semi is a continuous semitone value relative to A4.
+            // We decompose it into an integer part (lower pitch class)
+            // and a fractional part d in [0, 1).
+            //
+            // Kernel: wUpper = 0.5 * (1 - cos(pi * d))
+            //         wLower = 1 - wUpper
+            //
+            // At d=0:   wLower=1.0, wUpper=0.0  (exactly on lower bin)
+            // At d=0.5: wLower=0.5, wUpper=0.5  (halfway between)
+            // At d=1:   wLower=0.0, wUpper=1.0  (exactly on upper bin)
+            float semiShifted = semi + 9.0f;   // shift so C=0 (A is +9)
+            float semiMod = fmodf(semiShifted, 12.0f);
+            if (semiMod < 0.0f) semiMod += 12.0f;
+
+            int pcLow = (int)floorf(semiMod) % 12;
+            int pcHigh = (pcLow + 1) % 12;
+            float d = semiMod - floorf(semiMod);  // fractional part [0, 1)
+
+            float wHigh = 0.5f * (1.0f - cosf((float)M_PI * d));
+            float wLow = 1.0f - wHigh;
+
+            result.bins[pcLow]  += wLow * contribution;
+            result.bins[pcHigh] += wHigh * contribution;
+            result.totalEnergy  += contribution;
         }
     }
+
+    result.peakCount = peakCount;
 
     // Store current FFT for next frame's IF calculation
     if (ctx != NULL && ctx->specSize == specSize) {
@@ -342,6 +513,8 @@ Chromagram ComputeHPCP(ChromagramContext *ctx,
         ctx->hasPrev = TRUE;
     }
 
+    free(whitened);
+    free(envelope);
     free(mag);
     free(fftData);
     return result;

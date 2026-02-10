@@ -126,28 +126,6 @@ BOOL IsFrameStable(const float *samples, int sampleCount, float maxDbDiff)
     return dbDiff <= maxDbDiff;
 }
 
-// Simple spectral flatness approximation using zero-crossing rate
-float CalculateSpectralFlatness(const float *samples, int sampleCount, DWORD sampleRate)
-{
-    if (!samples || sampleCount < 2) return 1.0f;
-
-    int zeroCrossings = 0;
-    for (int i = 1; i < sampleCount; i++) {
-        if ((samples[i] >= 0.0f && samples[i-1] < 0.0f) ||
-            (samples[i] < 0.0f && samples[i-1] >= 0.0f)) {
-            zeroCrossings++;
-        }
-    }
-
-    float duration = (float)sampleCount / (float)sampleRate;
-    float zcRate = (float)zeroCrossings / duration;
-
-    float flatness = zcRate / 6000.0f;
-    if (flatness > 1.0f) flatness = 1.0f;
-
-    return flatness;
-}
-
 // Check for harmonic structure at the detected frequency.
 // Returns 0-1 indicating how harmonic the signal is.
 static float CheckHarmonicity(const float *samples, int sampleCount,

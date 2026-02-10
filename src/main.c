@@ -19,13 +19,6 @@
 #define MAX_RETRY_COUNT 3
 #define RETRY_DELAY_MS 100
 
-// Fixed pitch analysis window size.
-// 4096 samples at 48kHz = ~85ms — long enough for ~7 full periods at 80Hz
-// (the lowest frequency we detect), which gives YIN plenty of data to work with.
-// YIN's maxLag at 80Hz is 600 samples, and W = N/2 = 2048, so the integration
-// window is more than 3x the maximum lag — well above the minimum requirement.
-#define PITCH_WINDOW_SAMPLES 4096
-
 // State
 BOOL isRecording = FALSE;
 BOOL isPlaying = FALSE;
@@ -142,18 +135,8 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     tempChannels = ctx.pwfx->nChannels;
     printf("Capture format: channels=%d, sample rate=%lu\n", tempChannels, tempSampleRate);
 
-    // Initialize pitch detection (using instrument mode for broader compatibility)
-    PitchConfig pitchConfig;
-    PitchConfig_InitInstrument(&pitchConfig, tempSampleRate);
-
-    PitchTracker pitchTracker;
-    PitchTracker_Init(&pitchTracker);
-
     ScaleAccumulator scaleAcc;
     ScaleAccumulator_Init(&scaleAcc, tempSampleRate);
-
-    // Confidence output from YIN, used to weight scale histogram entries
-    float pitchConfidence = 0.0f;
 
     // Ring buffer for mono samples — decouples WASAPI packet reading from
     // pitch analysis. WASAPI always writes ALL samples here, analysis reads
@@ -175,6 +158,8 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     int ringHead = 0;          // next write position
     int ringCount = 0;         // total samples currently in ring buffer
     int newSamples = 0;        // samples written since last analysis
+    int totalPeaks = 0;        // cumulative spectral peaks across all frames
+    int totalFrames = 0;       // total analysis frames (including unstable)
 
     // Phase-derivative IF context for sub-bin frequency accuracy.
     // Stores previous frame's FFT phase to compute instantaneous
@@ -317,17 +302,22 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             // don't use the chromagram result from unstable frames).
             Chromagram chroma = ComputeHPCP(&chromaCtx, analysisBuffer, analysisSize, tempSampleRate);
 
+            totalFrames++;
+            totalPeaks += chroma.peakCount;
             // Only accumulate chromagram from stable frames
             if (stable && chroma.totalEnergy > 0.0f) {
                 ScaleAccumulator_AddChromagram(&scaleAcc, chroma.bins);
             }
 
-            // YIN for monophonic note display
-            if (stable) {
-                int pitchClass = DetectPitchTracked(analysisBuffer, analysisSize,
-                                                     &pitchConfig, &pitchTracker,
-                                                     &pitchConfidence);
-                (void)pitchClass;
+            // Auto-lock tuning estimation once enough peaks are collected.
+            // This adjusts the reference frequency for all subsequent HPCP
+            // frames, correcting for non-A440 tuning.
+            if (!chromaCtx.tuningLocked &&
+                chromaCtx.tuningPeakCount >= HPCP_TUNING_MIN_PEAKS) {
+                float offsetCents = EstimateTuning(&chromaCtx);
+                float correctedRef = HPCP_REF_FREQ * powf(2.0f, offsetCents / 1200.0f);
+                printf("Tuning estimated: %+.1f cents (A=%.1f Hz), locked after %d peaks\n",
+                       offsetCents, correctedRef, chromaCtx.tuningPeakCount);
             }
 
             newSamples -= hopSize;
@@ -340,30 +330,21 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     printf("Session peak level: %.4f (%.1f dB)\n", tempSessionPeak,
            tempSessionPeak > 0 ? 20.0f * log10f(tempSessionPeak) : -96.0f);
 
+    // Print tuning summary
+    if (chromaCtx.tuningLocked) {
+        float correctedRef = HPCP_REF_FREQ * powf(2.0f, chromaCtx.tuningOffsetCents / 1200.0f);
+        printf("Tuning: %+.1f cents (A=%.1f Hz) from %d peaks\n",
+               chromaCtx.tuningOffsetCents, correctedRef, chromaCtx.tuningPeakCount);
+    } else {
+        printf("Tuning: not enough data (%d peaks, need %d), used A=440 Hz\n",
+               chromaCtx.tuningPeakCount, HPCP_TUNING_MIN_PEAKS);
+    }
+
     // Analyze scale
     ScaleResult scaleResult = ScaleAccumulator_Analyze(&scaleAcc);
-    char scaleName[32];
-    ScaleResult_GetName(&scaleResult, scaleName, sizeof(scaleName));
-    printf("Detected scale: %s (confidence: %.2f, notes: %d)\n",
-           scaleName, scaleResult.confidence, scaleResult.totalNotes);
 
-    // Print pitch histogram for debugging (HPCP energy-weighted)
-    printf("HPCP histogram: ");
-    const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-    
-    // Normalize for display: show as percentage of total energy
-    float totalHpcpEnergy = 0.0f;
-    for (int i = 0; i < 12; i++) {
-        totalHpcpEnergy += scaleAcc.histogram[i];
-    }
-    
-    for (int i = 0; i < 12; i++) {
-        if (scaleAcc.histogram[i] > 0.0f && totalHpcpEnergy > 0.0f) {
-            float pct = 100.0f * scaleAcc.histogram[i] / totalHpcpEnergy;
-            printf("%s:%.1f%% ", noteNames[i], pct);
-        }
-    }
-    printf("(%d frames)\n", scaleAcc.totalCount);
+    // Print comprehensive diagnostics
+    ScaleAccumulator_PrintDiagnostics(&scaleAcc, &scaleResult, totalPeaks, totalFrames);
 
     PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(tempSessionPeak * 10000.0f), 0);
 

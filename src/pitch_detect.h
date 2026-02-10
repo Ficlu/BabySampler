@@ -46,7 +46,6 @@ void MidiToNoteName(int midiNote, char *buffer, int bufferSize);
 
 // Signal analysis utilities
 float CalculateRMS(const float *samples, int sampleCount);
-float CalculateSpectralFlatness(const float *samples, int sampleCount, DWORD sampleRate);
 BOOL IsFrameStable(const float *samples, int sampleCount, float maxDbDiff);
 
 // Core pitch detection (YIN algorithm)
