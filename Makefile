@@ -13,7 +13,7 @@ INCLUDEDIR = include
 TARGET = $(BINDIR)/babysampler
 
 # Object files
-OBJS = $(OBJDIR)/audio_capture.o $(OBJDIR)/audio_save.o $(OBJDIR)/main.o $(OBJDIR)/recording_list.o $(OBJDIR)/gui.o $(OBJDIR)/pitch_detect.o $(OBJDIR)/scale_detect.o
+OBJS = $(OBJDIR)/audio_capture.o $(OBJDIR)/audio_save.o $(OBJDIR)/main.o $(OBJDIR)/recording_list.o $(OBJDIR)/gui.o $(OBJDIR)/pitch_detect.o $(OBJDIR)/scale_detect.o $(OBJDIR)/chromagram.o 
 
 # Default rule to build everything
 all: $(TARGET)
@@ -51,6 +51,10 @@ $(OBJDIR)/pitch_detect.o: $(SRCDIR)/pitch_detect.c $(SRCDIR)/pitch_detect.h
 $(OBJDIR)/scale_detect.o: $(SRCDIR)/scale_detect.c $(SRCDIR)/scale_detect.h
 	@echo "Compiling scale_detect.c into scale_detect.o"
 	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/scale_detect.c -o $(OBJDIR)/scale_detect.o
+
+$(OBJDIR)/chromagram.o: $(SRCDIR)/chromagram.c $(SRCDIR)/chromagram.h
+	@echo "Compiling chromagram.c into chromagram.o"
+	$(CC) $(CFLAGS) -I$(INCLUDEDIR) -c $(SRCDIR)/chromagram.c -o $(OBJDIR)/chromagram.o
 
 
 # Create the necessary directories

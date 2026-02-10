@@ -88,6 +88,26 @@ void ScaleAccumulator_AddPitch(ScaleAccumulator *acc, int pitchClass, float weig
     }
 }
 
+void ScaleAccumulator_AddChromagram(ScaleAccumulator *acc, const float chromagram[12])
+{
+    // Check if the frame has any meaningful energy
+    float frameEnergy = 0.0f;
+    for (int i = 0; i < 12; i++) {
+        frameEnergy += chromagram[i];
+    }
+    if (frameEnergy < 0.0001f) return;
+
+    // Add all 12 bins directly to the histogram.
+    // Unlike AddPitch (which adds one pitch class per call), this
+    // adds the entire spectral energy distribution at once, capturing
+    // all simultaneous pitch classes in a polyphonic signal.
+    for (int i = 0; i < 12; i++) {
+        acc->histogram[i] += chromagram[i];
+    }
+    acc->totalWeight += frameEnergy;
+    acc->totalCount++;
+}
+
 // Compute Pearson correlation between two 12-element arrays.
 // Returns value in [-1, 1]. Higher = better match.
 //
@@ -129,7 +149,7 @@ static float PearsonCorrelation(const float *x, const float *y, int n)
 static void RotateProfile(const float *src, float *dst, int shift)
 {
     for (int i = 0; i < 12; i++) {
-        dst[i] = src[(i + shift) % 12];
+        dst[i] = src[(i - shift + 12) % 12];
     }
 }
 

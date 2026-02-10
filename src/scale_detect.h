@@ -49,6 +49,12 @@ void ScaleAccumulator_Reset(ScaleAccumulator *acc);
 // Higher-confidence detections contribute more to the distribution.
 void ScaleAccumulator_AddPitch(ScaleAccumulator *acc, int pitchClass, float weight);
 
+// Add a full 12-bin chromagram frame to the accumulator.
+// Used with HPCP for polyphonic key detection. Each bin's energy
+// is added directly to the histogram, so loud frames contribute
+// more than quiet ones (which is desirable).
+void ScaleAccumulator_AddChromagram(ScaleAccumulator *acc, const float chromagram[12]);
+
 // Analyze the accumulated pitch distribution against Krumhansl-Kessler
 // key profiles using Pearson correlation. Returns the best-matching key.
 ScaleResult ScaleAccumulator_Analyze(const ScaleAccumulator *acc);

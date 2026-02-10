@@ -9,8 +9,6 @@
 //   2. Cumulative mean normalization (eliminates octave/sub-harmonic errors)
 //   3. Absolute threshold with first-dip selection (prefers fundamental)
 //   4. Parabolic interpolation for sub-sample accuracy
-//   5. Hanning window applied before analysis to reduce spectral leakage
-//   6. High-pass filter called before detection to kill mains hum
 
 #include "pitch_detect.h"
 #include <math.h>
@@ -26,10 +24,10 @@ static const char* NOTE_NAMES[] = {
 void PitchConfig_InitVoice(PitchConfig *config, DWORD sampleRate)
 {
     config->sampleRate = sampleRate;
-    config->minFreq = 150.0f;
+    config->minFreq = 80.0f;
     config->maxFreq = 1200.0f;
     config->confidenceThreshold = 0.35f;
-    config->harmonicityThreshold = 0.25f;
+    config->harmonicityThreshold = 0.06f;
     config->transientThreshold = 4.0f;
     config->stabilityFrames = 2;
 }
@@ -37,10 +35,10 @@ void PitchConfig_InitVoice(PitchConfig *config, DWORD sampleRate)
 void PitchConfig_InitInstrument(PitchConfig *config, DWORD sampleRate)
 {
     config->sampleRate = sampleRate;
-    config->minFreq = 150.0f;
+    config->minFreq = 80.0f;
     config->maxFreq = 2000.0f;
     config->confidenceThreshold = 0.3f;
-    config->harmonicityThreshold = 0.15f;
+    config->harmonicityThreshold = 0.06f;
     config->transientThreshold = 6.0f;
     config->stabilityFrames = 1;
 }
@@ -99,59 +97,33 @@ float CalculateRMS(const float *samples, int sampleCount)
     return sqrtf(sum / sampleCount);
 }
 
-// High-pass filter to remove DC offset and mains hum (50/60Hz + harmonics).
-// Applied twice for ~12dB/octave rolloff. Cutoff at 100Hz provides:
-//   - ~24dB attenuation at 50Hz, ~18dB at 60Hz (kills mains hum)
-//   - ~12dB at 100Hz (kills second harmonics at 100/120Hz)
-//   - ~3dB at 150Hz (preserves the bottom of our detection range)
-// Previously 150Hz, which was attenuating the lowest detectable pitches by ~6dB.
-void ApplyHighPassFilter(float *samples, int sampleCount, DWORD sampleRate)
+// Check whether an analysis window is temporally stable (no note transitions).
+// Compares RMS energy in the first and second halves of the buffer. If they
+// differ by more than maxDbDiff dB, the frame likely straddles a note onset
+// or offset, and pitch detection on it will produce phantom frequencies from
+// the mix of two notes.
+//
+// Returns TRUE if the frame is stable (safe to analyze).
+BOOL IsFrameStable(const float *samples, int sampleCount, float maxDbDiff)
 {
-    if (!samples || sampleCount < 2) return;
+    if (!samples || sampleCount < 4) return TRUE;
 
-    float fc = 100.0f;
-    float dt = 1.0f / (float)sampleRate;
-    float RC = 1.0f / (2.0f * 3.14159265f * fc);
-    float alpha = RC / (RC + dt);
+    int halfCount = sampleCount / 2;
+    float rmsFirst  = CalculateRMS(samples, halfCount);
+    float rmsSecond = CalculateRMS(samples + halfCount, halfCount);
 
-    // First pass
-    float prevInput = samples[0];
-    float prevOutput = 0.0f;
+    // Both halves silent — no transition, just silence
+    if (rmsFirst < 0.001f && rmsSecond < 0.001f) return TRUE;
 
-    for (int i = 1; i < sampleCount; i++) {
-        float input = samples[i];
-        float output = alpha * (prevOutput + input - prevInput);
-        samples[i] = output;
-        prevInput = input;
-        prevOutput = output;
-    }
-    samples[0] = samples[1];
+    // One half silent, other not — definitely a transition
+    if (rmsFirst < 0.001f || rmsSecond < 0.001f) return FALSE;
 
-    // Second pass for steeper rolloff
-    prevInput = samples[0];
-    prevOutput = 0.0f;
+    float ratio = rmsFirst > rmsSecond
+                  ? rmsFirst / rmsSecond
+                  : rmsSecond / rmsFirst;
 
-    for (int i = 1; i < sampleCount; i++) {
-        float input = samples[i];
-        float output = alpha * (prevOutput + input - prevInput);
-        samples[i] = output;
-        prevInput = input;
-        prevOutput = output;
-    }
-    samples[0] = samples[1];
-}
-
-// Apply a Hanning window in-place to reduce spectral leakage at buffer edges.
-// Without this, discontinuities at the frame boundaries add broadband noise
-// to the difference function and reduce peak sharpness.
-void ApplyHanningWindow(float *samples, int sampleCount)
-{
-    if (!samples || sampleCount < 2) return;
-
-    for (int i = 0; i < sampleCount; i++) {
-        float w = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * (float)i / (float)(sampleCount - 1)));
-        samples[i] *= w;
-    }
+    float dbDiff = 20.0f * log10f(ratio);
+    return dbDiff <= maxDbDiff;
 }
 
 // Simple spectral flatness approximation using zero-crossing rate

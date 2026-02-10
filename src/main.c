@@ -12,6 +12,7 @@
 #include "recording_list.h"
 #include "pitch_detect.h"
 #include "scale_detect.h"
+#include "chromagram.h"
 
 #define INITIAL_BUFFER_SIZE (1024 * 1024)  // Start with 1MB buffer
 #define BUFFER_GROWTH_FACTOR 2
@@ -19,10 +20,10 @@
 #define RETRY_DELAY_MS 100
 
 // Fixed pitch analysis window size.
-// 4096 samples at 48kHz = ~85ms — long enough for ~6 full periods at 150Hz
+// 4096 samples at 48kHz = ~85ms — long enough for ~7 full periods at 80Hz
 // (the lowest frequency we detect), which gives YIN plenty of data to work with.
-// Previously this was variable and could be as small as ~960 samples (20ms),
-// which was too short for reliable low-frequency detection.
+// YIN's maxLag at 80Hz is 600 samples, and W = N/2 = 2048, so the integration
+// window is more than 3x the maximum lag — well above the minimum requirement.
 #define PITCH_WINDOW_SAMPLES 4096
 
 // State
@@ -125,9 +126,7 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     HWND hwnd = (HWND)lpParam;
     HRESULT hr;
     DWORD lastMeterUpdate = 0;
-    DWORD lastPitchUpdate = 0;
     const DWORD METER_UPDATE_INTERVAL = 50;
-    const DWORD PITCH_DETECT_INTERVAL = 80;  // Run pitch detection every 80ms
 
     printf("Starting recording thread\n");
 
@@ -156,20 +155,45 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     // Confidence output from YIN, used to weight scale histogram entries
     float pitchConfidence = 0.0f;
 
-    // Fixed-size pitch analysis buffer.
-    // Using PITCH_WINDOW_SAMPLES (4096) gives ~85ms at 48kHz, which provides
-    // enough periods for reliable YIN detection down to 150Hz.
-    int pitchBufferSize = PITCH_WINDOW_SAMPLES;
-    float *pitchBuffer = (float*)malloc(pitchBufferSize * sizeof(float));
-    int pitchBufferPos = 0;
+    // Ring buffer for mono samples — decouples WASAPI packet reading from
+    // pitch analysis. WASAPI always writes ALL samples here, analysis reads
+    // whenever a hop's worth of new data has arrived.
+    //
+    // Analysis window: 8192 samples (170ms at 48kHz).
+    // Doubled from the original 4096 to improve low-frequency resolution:
+    //   4096 → 11.7 Hz/bin → ~5 bins per semitone at 55 Hz (poor)
+    //   8192 →  5.9 Hz/bin → ~10 bins per semitone at 55 Hz (adequate)
+    // This lets HPCP's peak-picking correctly resolve adjacent semitones
+    // even in the lowest octave of the detection range.
+    //
+    // Hop: 2048 samples (43ms) gives ~23 frames/sec — enough statistical
+    // mass for K-K correlation while keeping good temporal density.
+    int analysisSize = 8192;
+    int hopSize = 2048;
+    int ringCapacity = analysisSize * 4;
+    float *ringBuffer = (float*)malloc(ringCapacity * sizeof(float));
+    int ringHead = 0;          // next write position
+    int ringCount = 0;         // total samples currently in ring buffer
+    int newSamples = 0;        // samples written since last analysis
+
+    // Phase-derivative IF context for sub-bin frequency accuracy.
+    // Stores previous frame's FFT phase to compute instantaneous
+    // frequency via inter-frame phase differences (Müller 2015, §8.2.1).
+    ChromagramContext chromaCtx;
+    ChromagramContext_Init(&chromaCtx, analysisSize, hopSize);
+
+    // Linear buffer for extracting analysis windows from the ring buffer
+    float *analysisBuffer = (float*)malloc(analysisSize * sizeof(float));
 
     tempBufferSize = INITIAL_BUFFER_SIZE;
     tempRecordBuffer = (BYTE*)malloc(tempBufferSize);
-    if (!tempRecordBuffer || !pitchBuffer) {
+    if (!tempRecordBuffer || !ringBuffer || !analysisBuffer) {
         MessageBox(hwnd, "Failed to allocate memory for audio buffer", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
         if (tempRecordBuffer) free(tempRecordBuffer);
-        if (pitchBuffer) free(pitchBuffer);
+        if (ringBuffer) free(ringBuffer);
+        if (analysisBuffer) free(analysisBuffer);
+        ChromagramContext_Free(&chromaCtx);
         tempRecordBuffer = NULL;
         isRecording = FALSE;
         UpdateRecordingStatus(hwnd, FALSE);
@@ -181,7 +205,9 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
         MessageBox(hwnd, "Failed to start audio capture", "Error", MB_OK | MB_ICONERROR);
         CleanupAudioCapture(&ctx);
         free(tempRecordBuffer);
-        free(pitchBuffer);
+        free(ringBuffer);
+        free(analysisBuffer);
+        ChromagramContext_Free(&chromaCtx);
         tempRecordBuffer = NULL;
         isRecording = FALSE;
         UpdateRecordingStatus(hwnd, FALSE);
@@ -189,8 +215,11 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     }
 
     printf("Audio capture started\n");
-    printf("Pitch analysis window: %d samples (%.1f ms at %lu Hz)\n",
-           pitchBufferSize, 1000.0f * pitchBufferSize / tempSampleRate, tempSampleRate);
+    printf("HPCP+IF analysis window: %d samples (%.1f ms), hop: %d samples (%.1f ms) at %lu Hz\n",
+           analysisSize, 1000.0f * analysisSize / tempSampleRate,
+           hopSize, 1000.0f * hopSize / tempSampleRate, tempSampleRate);
+    printf("Frequency resolution: %.1f Hz/bin, IF refinement: sub-Hz precision at all frequencies\n",
+           (float)tempSampleRate / (float)analysisSize);
 
     tempCapturedBytes = 0;
     tempSessionPeak = 0.0f;
@@ -238,15 +267,19 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
                 if (peak > packetPeak) packetPeak = peak;
                 if (peak > tempSessionPeak) tempSessionPeak = peak;
 
-                // Accumulate samples for pitch detection (downmix to mono)
+                // Downmix all frames to mono and write to ring buffer.
+                // Every sample goes in — nothing is ever dropped.
                 float *floatData = (float *)pData;
-                for (UINT32 i = 0; i < frameCount && pitchBufferPos < pitchBufferSize; i++) {
+                for (UINT32 i = 0; i < frameCount; i++) {
                     float mono = 0.0f;
                     for (WORD ch = 0; ch < tempChannels; ch++) {
                         mono += floatData[i * tempChannels + ch];
                     }
                     mono /= tempChannels;
-                    pitchBuffer[pitchBufferPos++] = mono;
+                    ringBuffer[ringHead] = mono;
+                    ringHead = (ringHead + 1) % ringCapacity;
+                    if (ringCount < ringCapacity) ringCount++;
+                    newSamples++;
                 }
             }
             tempCapturedBytes += totalBytes;
@@ -266,34 +299,38 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
             lastMeterUpdate = now;
         }
 
-        // Run pitch detection when buffer is full.
-        // Uses 50% overlap: after processing, we shift the second half to the
-        // front and continue filling from there. This means each sample appears
-        // in two analysis windows, doubling detection opportunities and ensuring
-        // notes near window boundaries get at least one clean analysis pass.
-        if (now - lastPitchUpdate >= PITCH_DETECT_INTERVAL && pitchBufferPos >= pitchBufferSize) {
-            // Apply high-pass filter to kill mains hum.
-            // Cutoff at 100Hz removes 50/60Hz hum and harmonics while preserving
-            // the 150Hz+ detection range.
-            ApplyHighPassFilter(pitchBuffer, pitchBufferPos, tempSampleRate);
-
-            // NOTE: No Hanning window here. YIN's difference function is inherently
-            // self-windowing (it integrates over W = N/2), so an explicit window is
-            // redundant and actually harmful — it zeroes out the buffer edges,
-            // reducing the effective signal length by ~40% and making the cmndf
-            // noisier. The YIN paper does not use windowing.
-
-            int pitchClass = DetectPitchTracked(pitchBuffer, pitchBufferPos, &pitchConfig, &pitchTracker, &pitchConfidence);
-
-            if (pitchClass >= 0) {
-                ScaleAccumulator_AddPitch(&scaleAcc, pitchClass, pitchConfidence);
+        // Run pitch analysis when a hop's worth of new samples has arrived.
+        while (newSamples >= hopSize && ringCount >= analysisSize) {
+            // Extract last analysisSize samples from ring buffer
+            int start = (ringHead - analysisSize + ringCapacity) % ringCapacity;
+            for (int i = 0; i < analysisSize; i++) {
+                analysisBuffer[i] = ringBuffer[(start + i) % ringCapacity];
             }
 
-            // 50% overlap: shift second half to front, continue filling from midpoint
-            int halfSize = pitchBufferSize / 2;
-            memmove(pitchBuffer, pitchBuffer + halfSize, halfSize * sizeof(float));
-            pitchBufferPos = halfSize;
-            lastPitchUpdate = now;
+            // Frame stability gate: skip windows that straddle note
+            // transitions. Transition frames produce phantom peaks from
+            // the mix of two frequencies, polluting the chromagram.
+            BOOL stable = IsFrameStable(analysisBuffer, analysisSize, 6.0f);
+
+            // Always compute HPCP to keep the phase context fresh for IF
+            // estimation (IF needs consecutive frames' phases, even if we
+            // don't use the chromagram result from unstable frames).
+            Chromagram chroma = ComputeHPCP(&chromaCtx, analysisBuffer, analysisSize, tempSampleRate);
+
+            // Only accumulate chromagram from stable frames
+            if (stable && chroma.totalEnergy > 0.0f) {
+                ScaleAccumulator_AddChromagram(&scaleAcc, chroma.bins);
+            }
+
+            // YIN for monophonic note display
+            if (stable) {
+                int pitchClass = DetectPitchTracked(analysisBuffer, analysisSize,
+                                                     &pitchConfig, &pitchTracker,
+                                                     &pitchConfidence);
+                (void)pitchClass;
+            }
+
+            newSamples -= hopSize;
         }
 
         if (FAILED(hr)) break;
@@ -310,22 +347,32 @@ DWORD WINAPI RecordingThread(LPVOID lpParam)
     printf("Detected scale: %s (confidence: %.2f, notes: %d)\n",
            scaleName, scaleResult.confidence, scaleResult.totalNotes);
 
-    // Print pitch histogram for debugging (now confidence-weighted)
-    printf("Pitch histogram: ");
+    // Print pitch histogram for debugging (HPCP energy-weighted)
+    printf("HPCP histogram: ");
     const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    
+    // Normalize for display: show as percentage of total energy
+    float totalHpcpEnergy = 0.0f;
     for (int i = 0; i < 12; i++) {
-        if (scaleAcc.histogram[i] > 0.0f) {
-            printf("%s:%.1f ", noteNames[i], scaleAcc.histogram[i]);
+        totalHpcpEnergy += scaleAcc.histogram[i];
+    }
+    
+    for (int i = 0; i < 12; i++) {
+        if (scaleAcc.histogram[i] > 0.0f && totalHpcpEnergy > 0.0f) {
+            float pct = 100.0f * scaleAcc.histogram[i] / totalHpcpEnergy;
+            printf("%s:%.1f%% ", noteNames[i], pct);
         }
     }
-    printf("(total weight: %.1f from %d detections)\n", scaleAcc.totalWeight, scaleAcc.totalCount);
+    printf("(%d frames)\n", scaleAcc.totalCount);
 
     PostMessage(hwnd, WM_UPDATE_PEAK, (WPARAM)(tempSessionPeak * 10000.0f), 0);
 
     ctx.pAudioClient->lpVtbl->Stop(ctx.pAudioClient);
     CleanupAudioCapture(&ctx);
 
-    free(pitchBuffer);
+    free(ringBuffer);
+    free(analysisBuffer);
+    ChromagramContext_Free(&chromaCtx);
 
     // Add the recording to the list (if we captured anything)
     if (tempCapturedBytes > 0 && tempRecordBuffer) {
